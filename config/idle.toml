@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+#  nri-idle — the idle behaviours this toolset injects into ~/.config/noctalia/config.toml
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+#
+#  THIS FILE IS THE INTERFACE. Edit it, run `nri-idle install`, and Noctalia does the rest.
+#  It is written in unmodified Noctalia syntax — nothing here is a bespoke format, so anything
+#  Noctalia documents works here, and anything not documented below is in MANUAL.md.
+#
+#  Add, rename or delete whole [idle.behavior.*] blocks. Renaming a block is how you get a
+#  fourth stage (e.g. a suspend at 15 min). Set `enabled = false` to keep a block around but
+#  switch it off. `timeout = 0` also disables a block, unless `locked_timeout` is set.
+#
+#  Every block here is a *named* behaviour; order comes from `behavior_order` below.
+#  Available actions:  lock | screen_off | suspend | lock_and_suspend | command
+#                      (`command` runs your shell command; `resume_command` runs on return)
+#
+#  After editing: `nri-idle render` to preview, `nri-idle install` to apply and reload,
+#  `nri-idle status` to see what the *running* shell resolved.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+[idle]
+# Order Noctalia evaluates (and lists) the named behaviours in. Unlisted names are appended,
+# unknown names are ignored — which is why a typo here is a warning, not an error.
+behavior_order = ["dim", "screen-off", "lock"]
+
+# Seconds of fade before a behaviour's command runs, on a full-monitor overlay.
+# 0 = run immediately, which is what keeps the timings below exact. Setting 2.0 makes the
+# screen fade to black over 2 s before dimming — but it delays *every* behaviour, so the real
+# timings become 52/72/122 s.
+pre_action_fade_seconds = 0.0
+
+# ── 50 s: dim the panel and kill the keyboard backlight ──────────────────────────────────────
+# A `command` behaviour, because Noctalia has no native "dim" action. `brightnessctl -s` saves
+# the current level; the matching resume_command restores it, so dimming never clobbers a level
+# you set by hand. Drop the `asus::kbd_backlight` parts on machines that have no such device.
+[idle.behavior.dim]
+timeout = 50
+action = "command"
+command = "brightnessctl -s && brightnessctl set 30% && brightnessctl --device='asus::kbd_backlight' -s && brightnessctl --device='asus::kbd_backlight' set 0"
+resume_command = "brightnessctl -r && brightnessctl --device='asus::kbd_backlight' -r"
+
+# ── 70 s: monitors off ──────────────────────────────────────────────────────────────────────
+# Native action: Noctalia turns the monitors off and restores them automatically on activity.
+[idle.behavior.screen-off]
+timeout = 70
+action = "screen_off"
+
+# ── 120 s: lock ─────────────────────────────────────────────────────────────────────────────
+# Native action via ext_session_lock_v1. `locked_timeout` is unset (0), so while the session is
+# locked this behaviour keeps using `timeout`; set locked_timeout = 300 to re-run it 5 min after
+# locking instead.
+[idle.behavior.lock]
+timeout = 120
+action = "lock"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+#  Examples, disabled. Delete `enabled = false` (or the block) to use them.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# Suspend after 15 minutes, locking first (action = "suspend" + lock_before_suspend = false
+# suspends without locking).
+[idle.behavior.suspend]
+timeout = 900
+action = "lock_and_suspend"
+enabled = false
+
+# A gentler dim that only applies while the session is locked: timeout = 0 means "never while
+# active", locked_timeout is used instead once the session is locked.
+[idle.behavior.locked-dim]
+timeout = 0
+locked_timeout = 30
+action = "command"
+command = "brightnessctl set 10%"
+resume_command = "brightnessctl -r"
+enabled = false

@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""nri-idle — install and inspect a Noctalia idle-behaviour fragment.
+
+The interface is deliberately four commands wide, with one behaviour behind each:
+
+    nri-idle render      the merged target file, printed. Writes nothing.
+    nri-idle install     splice the fragment into the target, validate, reload.
+    nri-idle status      what the fragment asks for vs. what Noctalia is running.
+    nri-idle uninstall   remove the managed block and nothing else.
+
+Everything a caller must know:
+
+  * `render` is pure. It is the test surface: install is render + write + validate + reload,
+    so the interesting logic is exercised without touching a real config.
+  * The target is spliced as *text* between two marker lines. User comments, key order and
+    formatting outside the block survive byte-for-byte, because nothing is ever parsed and
+    re-serialised. (A TOML round-trip would silently delete every comment in the file.)
+  * The fragment is parsed strictly with `tomllib` and must contain only `[idle]` /
+    `[idle.behavior.*]` tables. Splicing a `[shell]` table would override unrelated keys in
+    the user's config, so it is refused rather than merged.
+  * The candidate is validated by `noctalia config validate <candidate>` *before* the target
+    is written. A bad fragment therefore leaves the target untouched — the failure mode is
+    "nothing happened", never "config broken".
+  * Exactly one marker present is a corrupt state and is refused; the file is never guessed at.
+  * `noctalia` itself is a dependency of this program, so it is injected: `RealNoctalia` for
+    production, `FakeNoctalia` in tests. No test needs the shell installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FRAGMENT_NAME = "idle.toml"
+DEFAULT_TARGET = Path.home() / ".config" / "noctalia" / "config.toml"
+DEFAULT_RULES = Path.home() / ".config" / "media-idle-bridge" / "config.toml"
+
+
+def fragment_candidates(script_dir: Path, home: Path, env: str | None) -> list[Path]:
+    """Where the fragment may live, most specific first. Injected so it is testable."""
+    out: list[Path] = []
+    if env:
+        out.append(Path(env))
+    out.append(home / ".config" / "nri-idle" / FRAGMENT_NAME)  # installed, and yours to edit
+    out.append(script_dir.parent / "config" / FRAGMENT_NAME)  # running from a checkout
+    out.append(script_dir / "config" / FRAGMENT_NAME)
+    return out
+
+
+def resolve_fragment(
+    script_dir: Path, home: Path, env: str | None, explicit: Path | None = None
+) -> Path:
+    """Pick the fragment to use, or the place one should be created."""
+    if explicit is not None:
+        return explicit
+    candidates = fragment_candidates(script_dir, home, env)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+DEFAULT_FRAGMENT = resolve_fragment(HERE, Path.home(), os.environ.get("NRI_IDLE_FRAGMENT"))
+
+BEGIN = "# >>> nri-idle managed block — do not edit here; edit config/idle.toml in the repo, then re-run 'nri-idle install' >>>"
+END = "# <<< nri-idle managed block <<<"
+
+
+class Refused(Exception):
+    """The input cannot be acted on without risking the user's file."""
+
+
+# ── the Noctalia port ────────────────────────────────────────────────────────────────────
+
+
+class RealNoctalia:
+    """Adapter for the real `noctalia` binary."""
+
+    def __init__(self, binary: str = "noctalia") -> None:
+        self.binary = binary
+
+    def _run(self, args: list[str]) -> tuple[int, str]:
+        try:
+            p = subprocess.run(
+                [self.binary, *args], capture_output=True, text=True, timeout=30
+            )
+        except FileNotFoundError:
+            return 127, f"{self.binary}: not found"
+        except subprocess.TimeoutExpired:
+            return 124, f"{self.binary} {' '.join(args)}: timed out"
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+    def validate(self, candidate: Path) -> tuple[bool, str]:
+        rc, out = self._run(["config", "validate", str(candidate)])
+        return rc == 0, out.strip()
+
+    def reload(self) -> tuple[bool, str]:
+        rc, out = self._run(["msg", "config-reload"])
+        return rc == 0, out.strip()
+
+    def exported_idle(self) -> str:
+        rc, out = self._run(["config", "export", "full"])
+        return out if rc == 0 else ""
+
+
+class FakeNoctalia:
+    """Test adapter: records instead of executing, and can be told to reject a candidate."""
+
+    def __init__(self, validate_ok: bool = True, reload_ok: bool = True, export: str = "") -> None:
+        self.validate_ok = validate_ok
+        self.reload_ok = reload_ok
+        self.export = export
+        self.validated: list[Path] = []
+        self.reloaded = 0
+
+    def validate(self, candidate: Path) -> tuple[bool, str]:
+        self.validated.append(candidate)
+        return self.validate_ok, "fake: ok" if self.validate_ok else "fake: invalid"
+
+    def reload(self) -> tuple[bool, str]:
+        self.reloaded += 1
+        return self.reload_ok, "fake: reloaded"
+
+    def exported_idle(self) -> str:
+        return self.export
+
+
+# ── behaviour: pure, then effectful ──────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Behavior:
+    name: str
+    action: str
+    timeout: float
+    locked_timeout: float
+    enabled: bool
+
+    def summary(self) -> str:
+        off = "" if self.enabled else "  (disabled)"
+        lock = (
+            f", {self.locked_timeout:g}s while locked"
+            if self.locked_timeout > 0
+            else ""
+        )
+        return f"{self.name:<14} {self.action:<16} {self.timeout:g}s{lock}{off}"
+
+
+def read_fragment(path: Path) -> str:
+    """Read and vet the fragment. Raises Refused with a fixable message."""
+    if not path.is_file():
+        raise Refused(f"fragment not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        raise Refused(f"{path} is not valid TOML: {err}") from err
+
+    stray = [k for k in doc if k != "idle"]
+    if stray:
+        raise Refused(
+            f"{path} defines {', '.join('[' + s + ']' for s in stray)} outside [idle]. "
+            "This block is spliced verbatim into the user's config, so unrelated tables "
+            "would override unrelated keys. Keep the fragment to idle only."
+        )
+    if not doc.get("idle", {}).get("behavior"):
+        raise Refused(f"{path} defines no [idle.behavior.*] entries")
+    return text
+
+
+def behaviors(fragment_text: str) -> list[Behavior]:
+    idle = tomllib.loads(fragment_text).get("idle", {})
+    out = []
+    for name, spec in (idle.get("behavior") or {}).items():
+        out.append(
+            Behavior(
+                name=name,
+                action=str(spec.get("action", "command")),
+                timeout=float(spec.get("timeout", 0) or 0),
+                locked_timeout=float(spec.get("locked_timeout", 0) or 0),
+                enabled=bool(spec.get("enabled", True)),
+            )
+        )
+    return out
+
+
+def warnings(fragment_text: str) -> list[str]:
+    """Things that are legal but almost certainly typos."""
+    idle = tomllib.loads(fragment_text).get("idle", {})
+    defined = set((idle.get("behavior") or {}).keys())
+    out = []
+    for name in idle.get("behavior_order", []):
+        if name not in defined:
+            out.append(f"behavior_order names '{name}', which no behaviour defines (ignored by Noctalia)")
+    for b in behaviors(fragment_text):
+        if b.timeout == 0 and b.locked_timeout == 0:
+            out.append(f"behaviour '{b.name}' has timeout=0, so it never runs (or is locked-timeout only)")
+    return out
+
+
+def block(fragment_text: str) -> str:
+    body = fragment_text.strip("\n")
+    return f"{BEGIN}\n{body}\n{END}\n"
+
+
+HEADER_RE = re.compile(r"^\s*\[")
+IDLE_HEADER_RE = re.compile(r"^\s*\[\s*idle(\s*\.\s*[\w.-]+)*\s*\]\s*(#.*)?$")
+
+
+def is_idle_header(line: str) -> bool:
+    return bool(IDLE_HEADER_RE.match(line))
+
+
+def idle_regions(text: str) -> list[tuple[int, int]]:
+    """Line spans of the `[idle]` / `[idle.*]` tables *outside* any managed block.
+
+    TOML tables are delimited by header lines, so a table runs from its header to the next
+    header of any kind. Adjacent idle headers form one region.
+    """
+    lines = text.splitlines(keepends=True)
+    headers = [(i, is_idle_header(line)) for i, line in enumerate(lines) if HEADER_RE.match(line)]
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(headers):
+        index, idle = headers[i]
+        if not idle:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(headers) and headers[j + 1][1]:
+            j += 1
+        end = headers[j + 1][0] if j + 1 < len(headers) else len(lines)
+        spans.append((index, end))
+        i = j + 1
+    return spans
+
+
+def strip_idle(text: str) -> str:
+    """Remove every `[idle*]` table region. Only ever called under the explicit flag."""
+    lines = text.splitlines(keepends=True)
+    for start, end in reversed(idle_regions(text)):
+        del lines[start:end]
+    out = "".join(lines)
+    while "\n\n\n" in out:
+        out = out.replace("\n\n\n", "\n\n")
+    return out
+
+
+def user_text_of(target_text: str) -> str:
+    """The target with the managed block removed — i.e. only the user's own text."""
+    if BEGIN not in target_text or END not in target_text:
+        return target_text
+    head, _, rest = target_text.partition(BEGIN)
+    _, _, tail = rest.partition(END)
+    return head + tail
+
+
+def splice(target_text: str, fragment_text: str) -> str:
+    """Replace the managed block, or append it. Pure function — the heart of the module."""
+    new_block = block(fragment_text)
+    has_begin = BEGIN in target_text
+    has_end = END in target_text
+    if has_begin != has_end:
+        raise Refused(
+            "the managed block is damaged: exactly one of the two marker lines is present. "
+            f"Find them with: grep -n 'nri-idle managed block' {DEFAULT_TARGET}"
+        )
+    if has_begin:
+        head, _, rest = target_text.partition(BEGIN)
+        _, _, tail = rest.partition(END)
+        tail = tail.lstrip("\n")
+        joined = head + new_block
+        return joined + ("\n" + tail if tail else "")
+    if target_text.strip():
+        return target_text.rstrip("\n") + "\n\n" + new_block
+    return new_block
+
+
+def render(fragment: Path, target: Path, replace_idle: bool = False) -> str:
+    """The merged target file. Reads only; never writes.
+
+    If the target already defines idle tables of its own (hand-written, or left over from a
+    previous hand-edit), splicing would redefine them and Noctalia would refuse the file. That
+    is detected here, before anything is written, and refused with the remedy — replacing the
+    user's own idle text is destructive, so it only happens under an explicit flag.
+    """
+    fragment_text = read_fragment(fragment)
+    target_text = target.read_text(encoding="utf-8") if target.is_file() else ""
+    user_text = user_text_of(target_text)
+    if idle_regions(user_text):
+        if not replace_idle:
+            raise Refused(
+                f"{target} already defines [idle] tables outside the managed block, so splicing "
+                "would define them twice. Either delete them yourself, or re-run with "
+                "--replace-idle to have this tool remove them (a backup is taken first)."
+            )
+        target_text = splice(strip_idle(user_text), fragment_text)
+    return splice(target_text, fragment_text)
+
+
+def install(
+    fragment: Path,
+    target: Path,
+    noctalia,
+    dry_run: bool = False,
+    reload: bool = True,
+    replace_idle: bool = False,
+) -> list[str]:
+    """Splice, validate the candidate, then write. Returns human-readable steps."""
+    steps: list[str] = []
+    candidate_text = render(fragment, target, replace_idle=replace_idle)
+    for w in warnings(read_fragment(fragment)):
+        steps.append(f"warning: {w}")
+
+    if dry_run:
+        steps.append(f"dry-run: {target} would be written ({len(candidate_text)} bytes)")
+        return steps
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".toml", delete=False, dir=target.parent, encoding="utf-8"
+    ) as tmp:
+        tmp.write(candidate_text)
+        probe = Path(tmp.name)
+    try:
+        ok, message = noctalia.validate(probe)
+        steps.append(f"validated candidate: {'ok' if ok else 'FAILED'}")
+        if not ok:
+            raise Refused(
+                f"Noctalia rejected the merged config, so {target} was left untouched:\n{message}"
+            )
+    finally:
+        probe.unlink(missing_ok=True)
+
+    if target.is_file():
+        backup = target.with_suffix(target.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(target, backup)
+        steps.append(f"backed up: {backup}")
+    target.write_text(candidate_text, encoding="utf-8")
+    steps.append(f"wrote: {target}")
+
+    if reload:
+        ok, message = noctalia.reload()
+        steps.append(f"reloaded the running shell: {'ok' if ok else 'FAILED — ' + message}")
+    steps.append("check what is actually running with: nri-idle status")
+    return steps
+
+
+def parsed_idle_behaviors(export_text: str) -> list[Behavior]:
+    """Behaviours as Noctalia resolved them — proof about the *running* config, not the file."""
+    if not export_text.strip():
+        return []
+    try:
+        doc = tomllib.loads(export_text)
+    except tomllib.TOMLDecodeError:
+        return []
+    idle = doc.get("idle", {})
+    out = []
+    for name, spec in (idle.get("behavior") or {}).items():
+        out.append(
+            Behavior(
+                name=name,
+                action=str(spec.get("action", "command")),
+                timeout=float(spec.get("timeout", 0) or 0),
+                locked_timeout=float(spec.get("locked_timeout", 0) or 0),
+                enabled=bool(spec.get("enabled", True)),
+            )
+        )
+    return out
+
+
+def effective(behaviors_: list[Behavior]) -> list[Behavior]:
+    """The behaviours Noctalia actually registers: enabled, with a timeout that can fire.
+
+    Disabled blocks, and blocks whose only timeout is 0, are deliberately absent from
+    `noctalia config export full` — treating that as drift would cry wolf on every
+    example you keep switched off.
+    """
+    return [b for b in behaviors_ if b.enabled and (b.timeout > 0 or b.locked_timeout > 0)]
+
+
+def status(fragment: Path, target: Path, noctalia) -> int:
+    fragment_text = read_fragment(fragment)
+    want = behaviors(fragment_text)
+    target_text = target.read_text(encoding="utf-8") if target.is_file() else ""
+    managed = BEGIN in target_text and END in target_text
+    hand_written = idle_regions(user_text_of(target_text))
+    up_to_date = managed and splice(target_text, fragment_text) == target_text
+
+    print(f"fragment : {fragment}")
+    print(f"target   : {target}")
+    print(f"managed  : {'yes' if managed else 'no'}"
+          + ("  (out of date — re-run 'nri-idle install')" if managed and not up_to_date else ""))
+    if hand_written:
+        print(f"           {len(hand_written)} idle table region(s) in the target are NOT managed:")
+        print("           install refuses while they exist — migrate with 'nri-idle install --replace-idle'")
+    print(f"rules    : {DEFAULT_RULES} {'(present)' if DEFAULT_RULES.is_file() else '(absent)'}")
+    for w in warnings(fragment_text):
+        print(f"warning  : {w}")
+
+    print("\nrequested by the fragment:")
+    for b in want:
+        print(f"  {b.summary()}")
+
+    print("\nresolved by the running Noctalia (noctalia config export full):")
+    live = parsed_idle_behaviors(noctalia.exported_idle())
+    if not live:
+        print("  (nothing — is Noctalia running?)")
+        return 1
+    for b in live:
+        print(f"  {b.summary()}")
+
+    drift = [b.name for b in effective(want) if b not in live]
+    if drift:
+        print(f"\ndrift    : {', '.join(drift)} — the file says one thing, the shell another.")
+        print("           Run 'noctalia msg config-reload' (or 'nri-idle install').")
+        return 1
+    print(f"\nevery requested behaviour that should be running is live ({len(effective(want))}).")
+    return 0
+
+
+def uninstall(fragment: Path, target: Path, noctalia, dry_run: bool = False) -> list[str]:
+    steps: list[str] = []
+    if not target.is_file():
+        raise Refused(f"{target} does not exist")
+    target_text = target.read_text(encoding="utf-8")
+    if BEGIN not in target_text:
+        steps.append(f"nothing to do: no managed block in {target}")
+        return steps
+    # Drop the block and the blank line that separated it from the user's own text.
+    head, _, rest = target_text.partition(BEGIN)
+    _, _, tail = rest.partition(END)
+    stripped = head.rstrip("\n") + ("\n\n" + tail.lstrip("\n") if tail.strip() else "\n")
+    if dry_run:
+        steps.append(f"dry-run: the managed block would be removed from {target}")
+        return steps
+    backup = target.with_suffix(target.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(target, backup)
+    target.write_text(stripped, encoding="utf-8")
+    steps.append(f"backed up: {backup}")
+    steps.append(f"removed the managed block from {target}")
+    ok, message = noctalia.reload()
+    steps.append(f"reloaded the running shell: {'ok' if ok else 'FAILED — ' + message}")
+    steps.append("note: the media bridge is separate; stop it with: systemctl --user disable --now media-idle-bridge")
+    return steps
+
+
+# ── entry point ──────────────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="nri-idle",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("command", choices=["render", "install", "status", "uninstall"])
+    ap.add_argument("--fragment", type=Path, default=DEFAULT_FRAGMENT,
+                    help=f"the idle fragment to inject (default: {DEFAULT_FRAGMENT})")
+    ap.add_argument("--target", type=Path, default=DEFAULT_TARGET,
+                    help=f"the Noctalia config to inject into (default: {DEFAULT_TARGET})")
+    ap.add_argument("--noctalia", default="noctalia", help="the noctalia binary to drive")
+    ap.add_argument("--dry-run", action="store_true", help="say what would happen; write nothing")
+    ap.add_argument("--no-reload", action="store_true", help="do not reload the running shell")
+    ap.add_argument(
+        "--replace-idle",
+        action="store_true",
+        help="remove idle tables the target already defines outside the managed block "
+             "(how you migrate a hand-written idle config under management)",
+    )
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    noctalia = RealNoctalia(args.noctalia)
+    try:
+        if args.command == "render":
+            sys.stdout.write(render(args.fragment, args.target, replace_idle=args.replace_idle))
+            return 0
+        if args.command == "install":
+            for step in install(args.fragment, args.target, noctalia,
+                                dry_run=args.dry_run, reload=not args.no_reload,
+                                replace_idle=args.replace_idle):
+                print(step)
+            return 0
+        if args.command == "status":
+            return status(args.fragment, args.target, noctalia)
+        for step in uninstall(args.fragment, args.target, noctalia, dry_run=args.dry_run):
+            print(step)
+        return 0
+    except Refused as err:
+        print(f"refused: {err}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

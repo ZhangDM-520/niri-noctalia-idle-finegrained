@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Fake MPRIS player for testing media-idle-bridge without a real video app.
+
+Usage: fake-mpris-player <identity> <Playing|Paused|Stopped> [url] [seconds]
+"""
+import sys
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+
+class FakePlayer(dbus.service.Object):
+    def __init__(self, bus_name, identity, status, url):
+        super().__init__(bus_name, "/org/mpris/MediaPlayer2")
+        self.props = {
+            "org.mpris.MediaPlayer2": {"Identity": identity, "CanQuit": False},
+            "org.mpris.MediaPlayer2.Player": {
+                "PlaybackStatus": status,
+                "Metadata": dbus.Dictionary(
+                    {"xesam:url": url, "xesam:title": "fake title"}, signature="sv"),
+            },
+        }
+
+    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        return self.props[interface][prop]
+
+    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return dbus.Dictionary(self.props.get(interface, {}), signature="sv")
+
+
+def main():
+    identity, status = sys.argv[1], sys.argv[2]
+    url = sys.argv[3] if len(sys.argv) > 3 else ""
+    seconds = float(sys.argv[4]) if len(sys.argv) > 4 else 30.0
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    tag = identity.replace(".", "_").replace(" ", "_")
+    name = dbus.service.BusName(f"org.mpris.MediaPlayer2.faketest_{tag}", bus)
+    FakePlayer(name, identity, status, url)
+    loop = GLib.MainLoop()
+    GLib.timeout_add(int(seconds * 1000), lambda: (loop.quit(), False)[1])
+    print(f"fake player up: identity={identity!r} status={status} url={url!r} for {seconds}s",
+          flush=True)
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

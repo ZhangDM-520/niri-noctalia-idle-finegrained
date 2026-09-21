@@ -1,0 +1,16 @@
+[Unit]
+Description=Media-aware idle inhibitor bridge (video inhibits dim/screen-off/lock)
+Documentation=file:%h/.local/bin/media-idle-bridge
+# niri is a user service bound to graphical-session.target; this must not outlive the session.
+After=niri.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/media-idle-bridge
+Restart=on-failure
+RestartSec=3
+# No StandardOutput/StandardError redirection: journalctl --user -u media-idle-bridge keeps the log.
+
+[Install]
+WantedBy=graphical-session.target
