@@ -103,6 +103,11 @@ Two rules interact, and they are worth knowing exactly because both are easy to 
   you get "be gentler after locking" without a second idle owner.
 * Negative or non-finite values are rejected with a warning and the behaviour is dropped.
 
+> `locked_timeout` is consulted **only** where a notification is created or recreated — one call site
+> (`effectiveTimeoutSeconds()`) reached from `recreateBehaviorNotification()`. On a Noctalia carrying the
+> upstream lock fix (PR #4002) that has a consequence worth knowing: a behaviour that has *already*
+> fired is no longer re-armed when the session locks, so `locked_timeout` cannot re-target it. See §9.1.
+
 ## 5. Actions
 
 | `action` | What happens | On return |
@@ -224,6 +229,16 @@ The log is the authority. Registration and firing appear as:
 `nri-idle install` does for you. If the log shows no new `registered idle behavior` line, your change
 is on disk and not in effect.
 
+For "did the screen actually turn off?", do not read the log — read the kernel:
+
+```bash
+cat /sys/class/drm/*/dpms          # On / Off / Standby / Suspend, per output, straight from DRM
+watch -n0.2 -t cat /sys/class/drm/card1-eDP-1/dpms   # who turns the panel on, and when
+```
+
+That is the signal §9.1 is measured with: it lags the intent by milliseconds and no amount of
+reassuring log output can fake it.
+
 ## 9. Pitfalls, all measured
 
 * **The fade is global** — see §3.
@@ -241,6 +256,69 @@ is on disk and not in effect.
 * **A permanently "running" audio stream is not evidence of playback.** Noctalia's own UI-sound stream
   sits in `state=running` forever, and a muted ALSA sink still reports `running`. Anything that
   decides "media is playing" from PipeWire must allow-list, never deny-list. (See §10.)
+* **Locking wakes the screen back up and replays the chain** on Noctalia ≤ 5.1.0 — a Noctalia bug, not a
+  config mistake, and already fixed upstream. Mechanism, evidence and the stopgap: §9.1.
+
+### 9.1 Locking wakes the screen back up (Noctalia ≤ 5.1.0; fixed upstream)
+
+*(measured on niri 26.04 / Noctalia 5.1.0, 2026-09-22; signal: `/sys/class/drm/*/dpms`)*
+
+**Symptom.** `dim 50 → screen off 70 → lock 120` does not end dark and locked: the lock lights the
+screen back up, and the chain then replays from the lock instant.
+
+**Mechanism.** `IdleManager::setSessionLocked()` runs on every lock *and* unlock and calls
+`recreateBehaviorNotifications()`, whose per-behaviour half calls `runResumeBehavior()` when
+`phase == BehaviorPhase::Idled`, and then destroys and recreates the notification. At a 120 s lock,
+`dim` (fired at 50 s) and `screen-off` (fired at 70 s) are both idled:
+
+| Behaviour | Resume that runs at the lock | Visible effect |
+| :-- | :-- | :-- |
+| `dim` | `resume_command` → `brightnessctl -r` | backlight returns to full |
+| `screen-off` | implicit `resumeAction` = ScreenOn → monitors on | **the screen wakes** |
+
+Recreating every notification then restarts all three countdowns, which is the "waits for the timeout
+again" half of the report. Note that `action = "screen_off"` **always** carries that ScreenOn resume
+action: `resolveIdleBehaviorActions()` hard-wires it, and no config key removes it.
+
+**Evidence** (unfixed build, shortened to 10/15/20 s so the cycle fits in a coffee break):
+
+```
+15 s     [idle] idle behavior 'screen-off' triggered          dpms=Off
+20 s     [idle] idle behavior 'lock' triggered
+20.000 s [lockscreen] session is locked                       dpms=On  0.1 s later
+20.310 s [idle] idle behavior notifications re-armed
+35 s     [idle] idle behavior 'screen-off' triggered          <- +15 s from the re-arm, not from the lock
+```
+
+niri is not the culprit: it powers monitors on only at **unlock** (`src/handlers/mod.rs`, `fn unlock()`
+→ `activate_monitors()`), and the lock screen never touches output power.
+
+**Fixed upstream, not here:** [#4190](https://github.com/noctalia-dev/noctalia/issues/4190) /
+[#4002](https://github.com/noctalia-dev/noctalia/pull/4002) — see the README. With the fix, an idled
+behaviour keeps its state *and* its notification, no resume runs at the lock, and the real input that
+wakes the seat still delivers a `resumed` — so the panel comes back **and** brightness is restored.
+Measured on niri: `dpms` stayed `Off` across the lock (no wake, no replay) and the backlight returned
+at 75 % on the owner's return.
+
+**Stopgap on an unfixed build.** Replace the `screen_off` stage with a `command` stage that asks
+Noctalia to blank the outputs over IPC. A `command` action resolves to **no** resume action, so nothing
+powers the monitors on at the lock:
+
+```toml
+[idle.behavior.screen-off]
+timeout = 70
+action = "command"
+command = "noctalia msg dpms-off"
+```
+
+The panel then stays dark across the lock, and `dpms-on` is not needed in `resume_command` because the
+compositor powers monitors on for the input that wakes the seat. The countdowns still restart, so the
+three commands run once more *while the session is locked* — invisible with the panel off, and the
+brightness save/restore pairing stays consistent because `dim` resumes before it re-fires. (This
+stopgap's mechanism is source-verified — `resolveIdleBehaviorActions()` returns an empty resume action
+for `command` — but it is documented rather than measured here, because this host moved to the fixed
+build. Workaround A, "set a small `locked_timeout` so the wake is undone quickly", does not survive the
+upstream fix: see §4.)
 
 ## 10. Media rules
 

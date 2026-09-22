@@ -7,6 +7,9 @@ idle timers should know the difference between music and video.**
 * **Video playing → nothing fires.** No dim, no blank, no lock, while a film is on.
 * **Music playing → the normal chain runs.** Music is not "media"; it must not keep your screen awake.
 * Your policy lives in **one editable file in Noctalia's own syntax** — no bespoke format to learn.
+* **One known upstream bug**: on Noctalia ≤ 5.1.0 the lock action wakes the screen back up and replays
+  the chain. It is fixed upstream and not patchable from config — see
+  [the section below](#a-known-upstream-bug-locking-wakes-the-screen-back-up).
 
 Verified on niri 26.04 (v26.04-114), Noctalia 5.1.0, swayidle 1.9.0, Wayland.
 
@@ -105,6 +108,45 @@ The Python suite runs at the CLI's interface with the `noctalia` binary injected
 running shell nor a compositor. The bridge suite drives a synthetic MPRIS player and asserts on logind's
 `BlockInhibited` — a state signal, not a 10-second guess about whether the screen *would* have dimmed.
 
+## A known upstream bug: locking wakes the screen back up
+
+The cause is inside Noctalia, so there is nothing to fix here — and it is **already fixed upstream**, so
+there is usually nothing to work around either. This section exists because it is the one failure people
+search for after installing, and because "my screen lights up when it locks" looks like this toolset's
+fault.
+
+On Noctalia **≤ 5.1.0** (including `noctalia-git` built before PR #4002), the lock transition re-arms
+every idle behaviour and, for each one that has already fired, runs its *resume* action first. With the
+shipped policy: the screen has been off since 70 s, then at 120 s `screen_off`'s hard-wired resume action
+powers the monitors **back on**, `dim`'s `resume_command` restores full brightness, and all three
+countdowns restart from the lock instant — so *dim → off → lock* ends as *lock → wake → 50 s → dim →
+20 s → off*.
+
+Measured here on niri 26.04 with `/sys/class/drm/card1-eDP-1/dpms` as the signal (kernel DPMS state, not
+log wording — it cannot be fooled by a reassuring log line). Running a shortened 10/15/20 s chain:
+
+```
+15 s     [idle] idle behavior 'screen-off' triggered          dpms=Off
+20 s     [idle] idle behavior 'lock' triggered
+20.000 s [lockscreen] session is locked                       dpms=On  0.1 s later  <- the wake
+20.310 s [idle] idle behavior notifications re-armed                            <- the replay
+35 s     [idle] idle behavior 'screen-off' triggered                            <- +15 s from the
+                                                                                   re-arm, not the lock
+```
+
+Reproducible on demand, and niri itself is not the culprit: it powers monitors on only at *unlock*
+(`handlers/mod.rs`, `fn unlock()` → `activate_monitors()`), and the lock screen never touches output
+power.
+
+| Ref | State |
+| :-- | :-- |
+| [noctalia-dev/noctalia#4190](https://github.com/noctalia-dev/noctalia/issues/4190) | The bug report — same symptom, same compositor. A second independent niri reproduction, with the DPMS evidence above, was added by this repo's author. |
+| [noctalia-dev/noctalia#4002](https://github.com/noctalia-dev/noctalia/pull/4002) | The fix (`mergeable`, closes #4190). Manually verified on niri by this repo's author, including with `media-idle-bridge` holding both inhibitor kinds at once. |
+
+**What to do:** nothing, normally — take the Noctalia update once the fix lands. If you are pinned to a
+release without it, [MANUAL §9.1](MANUAL.md#91-locking-wakes-the-screen-back-up-noctalia--510-fixed-upstream)
+has the one-line stopgap.
+
 ## Limitations, stated plainly
 
 * **An app's own inhibitor cannot be overridden.** Some players inhibit idle themselves; the bridge can
@@ -128,6 +170,7 @@ tests/test_nri_idle.py     interface tests, Noctalia injected
 tests/bridge-tests.sh      live media classification suite
 docs/DESIGN.md             why the seams are where they are
 MANUAL.md                  Noctalia idle syntax + media rules reference
+CHANGELOG.md               what changed, and which upstream issues are in play
 ```
 
 ## Licence

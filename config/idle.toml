@@ -49,6 +49,10 @@ action = "screen_off"
 # Native action via ext_session_lock_v1. `locked_timeout` is unset (0), so while the session is
 # locked this behaviour keeps using `timeout`; set locked_timeout = 300 to re-run it 5 min after
 # locking instead.
+#
+# On Noctalia ≤ 5.1.0 the lock transition used to wake the screen and replay this whole chain. That
+# is an upstream bug, not a config mistake, and it is fixed upstream — see MANUAL §9.1 for the
+# mechanism and the stopgap if you are pinned to an unfixed build.
 [idle.behavior.lock]
 timeout = 120
 action = "lock"
