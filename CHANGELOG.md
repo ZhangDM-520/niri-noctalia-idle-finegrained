@@ -4,6 +4,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 
 ## [Unreleased]
 
+### Fixed
+
+- `tests/bridge-tests.sh` no longer leaves the media bridge stopped. The suite stops the service to
+  take exclusive control of the inhibitor path, and now restarts it on exit — but only if it was
+  running before. Found the hard way: a run stopped an 11-hour-old service and left the desktop
+  without media awareness until it was noticed.
+
 ### Added
 
 - **MANUAL §9.1 — "locking wakes the screen back up"**, with the mechanism, the DPMS evidence, and a

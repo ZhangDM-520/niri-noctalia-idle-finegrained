@@ -93,7 +93,27 @@ expect_no_idle_lock() {
 start_player() { "$FAKE" "$@" >>"$BRIDGE_LOG" 2>&1 & echo $!; }
 stop_player()  { [ -n "${1:-}" ] && kill "$1" 2>/dev/null; sleep 1; }
 
-systemctl --user stop media-idle-bridge 2>/dev/null
+SERVICE=media-idle-bridge
+# This suite needs exclusive control of the inhibitor path, so it stops the user's bridge - and must
+# put it back. An earlier revision left the owner's media bridge stopped for four minutes after a
+# run: a test suite that silently disables part of the desktop is worse than no test suite.
+service_was_active=$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)
+
+cleanup() {
+  [ -n "${BRIDGE_PID:-}" ] && kill "$BRIDGE_PID" 2>/dev/null
+  for d in /proc/[0-9]*; do
+    cmd=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null) || continue
+    case "$cmd" in "python3 $FAKE"*) kill "${d#/proc/}" 2>/dev/null ;; esac
+  done
+  if [ "$service_was_active" = "active" ]; then
+    systemctl --user start "$SERVICE" 2>/dev/null
+    echo "restored $SERVICE (it was active before this run)"
+  fi
+}
+trap cleanup EXIT
+
+systemctl --user stop "$SERVICE" 2>/dev/null
+[ "$service_was_active" = "active" ] && echo "note  stopped $SERVICE for this run; restarted at the end"
 "$BRIDGE" --debug >"$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 sleep 2
