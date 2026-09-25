@@ -1,0 +1,6 @@
+# A running shell that resolved no behaviours at all: `[idle]` is present but empty. This is
+# indistinguishable from "not running" today, so it must degrade to that behaviour — it is
+# never a crash and never a parse error.
+
+[idle]
+behavior_order = []

@@ -45,6 +45,46 @@ Invariants the interface promises:
 4. **The fragment is scoped.** A fragment defining `[shell]` is refused, because it would be spliced in
    verbatim and override unrelated keys.
 
+Inside the implementation, two value types carry the load, and both are deliberately *text-first*:
+
+**`ManagedBlock`** — the managed block located **once** over the document text: `state`
+(`absent | intact | begin_only | end_only | interleaved | multiple | unparseable_body`), marker-line
+spans, and the body. `replaced()` / `without()` / `user_text()` are the only text surgery in the
+module; `locate()` recognises markers by **stable prefix** (whole line), so blocks written by older
+versions keep working and `install` may rewrite the marker text freely. Every mutation is
+`verify_rewrite`-checked: the result must parse and every key but `idle` must compare equal — the
+write contract is *"only `[idle]` may change"*, enforced by `tomllib` rather than by hope. That check
+is what makes marker text buried inside a multi-line TOML string a **refusal** instead of corruption,
+and what lets `--replace-idle` verify each line-scanned removal instead of trusting a regex. Damage
+states refuse with a remedy everywhere — including `uninstall`, which used to shrug at a damaged file.
+
+**`ParsedFragment`** — the fragment parsed **once** per command (text verbatim, plus parsed doc,
+behaviours, warnings). The TOML→behaviour normaliser (`behaviors_of`) is shared by both provenances:
+fragment intent and the running shell's export (`normalise_export`, a pure function sitting **beside**
+the `noctalia` port — the port's contract stays "raw bytes from the binary", so `RealNoctalia` and
+`FakeNoctalia` stay honest adapters). `effective()` — "which behaviours *should* be registered" —
+stays a policy filter outside parsing. Drift then compares two things produced by one code path,
+instead of two copies that must silently agree.
+
+The seam between the two types is deliberate: the text layer returns spans and untouched bytes and
+never constructs a behaviour; the parse layer consumes text and never computes spans.
+
+Three smaller contracts round out the CLI's interface:
+
+* **`FLAG_APPLICABILITY`** is one table read by the argument parser (help text), the dispatch guard and
+  the tests alike — a flag that does not apply to a command is a usage error, not silence. The parser
+  and the test matrix cannot drift apart because both read the table.
+* **`ExportResult(kind, text, detail)`** sits at the `noctalia` port's edge (`export_outcome(rc, raw)`):
+  "shell not found" / "timed out" / "failed" / "unparseable" / "empty" are *expected diagnostic
+  outcomes*, so `status` can say which one happened and exit 3 or 4 accordingly instead of guessing
+  "is Noctalia running?". The port's contract stays raw bytes plus an outcome; `FakeNoctalia` mirrors
+  it with fail-on-demand modes.
+* **`layout()` owns the installed layout** (fragment, target, rules, `bin_dir`, unit) and `nri-idle
+  paths` prints it as `key=value` — `install.sh` is a *caller* of that knowledge, never a second owner.
+  A `Steps` result carries exit policy out of `install`/`uninstall` (reload failure ⇒ exit 1), and
+  `install --dry-run` runs the same validator as the real run from a system-temp probe: the rehearsal
+  promises same decisions, same refusals, zero writes to user state.
+
 ### `media-idle-bridge` — the other deep one
 
 ```

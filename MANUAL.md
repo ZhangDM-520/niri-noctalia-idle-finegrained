@@ -211,10 +211,26 @@ pre_action_fade_seconds = 2.0
 
 ```bash
 nri-idle status                 # fragment vs. what the running shell resolved, plus drift
+nri-idle paths                  # where the fragment, target, rules, binaries and unit live
 noctalia config export full     # the parsed config, with defaults filled in
 noctalia config validate        # is the file parseable at all?
 tail -f ~/.cache/noctalia/noctalia.log | grep '\[idle\]'
 ```
+
+`status` has three freshness states for the managed block: **up to date**, **formatting only**
+(bytes differ, meaning is identical — an informational note; `nri-idle install` will normalise it),
+and **out of date** (the meaning differs). Exit codes are a contract, so scripts can tell the failure
+classes apart:
+
+| Command | 0 | 1 | 2 | 3 | 4 |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| `status` | healthy (incl. formatting-only) | out of date, or a behaviour missing from the shell | refused (bad fragment, damaged block) | the shell could not be read (`noctalia` missing, export timed out or failed) | the shell exports nothing |
+| `install` / `uninstall` | done | the reload failed | refused | — | — |
+| `render` / `paths` | done | — | refused | — | — |
+
+A flag that does not apply to a command is a usage error (exit 2), never silent. `install --dry-run`
+rehearses the real run — same decisions, same refusals, zero writes — and `uninstall` on a damaged
+target refuses with a remedy instead of guessing.
 
 The log is the authority. Registration and firing appear as:
 
@@ -326,16 +342,27 @@ The bridge (`bin/media-idle-bridge`) reads `~/.config/media-idle-bridge/config.t
 question: *is a **video** playing right now?* If yes it holds an idle inhibitor; if no it releases it.
 Music deliberately does **not** inhibit — it just lets the chain run.
 
-Rules are evaluated in this order, first match wins:
+Rules are evaluated in two layers. **Within one player**, the first matching rule wins:
 
 1. A **Playing** MPRIS player whose Identity matches `music_players` → **music**.
 2. A **Playing** MPRIS player whose Identity matches `video_players` → **video**.
 3. A **Playing** browser (`browser_players`, matched on Identity or bus name):
    * `xesam:url` matches `music_hosts` → **music**;
-   * otherwise → `browser_default`.
-4. **PipeWire backstop**: a running `Stream/Output` node whose `application.process.binary` matches
-   `video_binaries`, or whose `media.role` matches `video_roles`, and which does not match
-   `deny_binaries` → **video**.
+   * `xesam:url` present and not a music host → **video**;
+   * no `xesam:url` at all → `browser_default` (accepts `"video"`, `"music"` or `"unknown"`;
+     anything else is a load-time warning and falls back to `"video"`).
+
+**Across players and streams**, the verdicts are then aggregated:
+
+* Any **video** — from any MPRIS player *or* the backstop — inhibits, even while music plays.
+  Video beats music when both are playing.
+* **Music never inhibits, and never masks the backstop**: a music player plus a video playing
+  outside MPRIS (e.g. `ffplay`) still inhibits. This asymmetry is deliberate — a missed video dims
+  the screen over a film; a missed song just dims the screen.
+
+4. **PipeWire backstop** (evaluated independently, not "otherwise"): a `running` `Stream/Output`
+   node whose `application.process.binary` matches `video_binaries`, or whose `media.role` matches
+   `video_roles`, and which does not match `deny_binaries` → **video**.
 
 ```toml
 video_players   = ["mpv", "vlc", "celluloid", "haruna", "totem", "smplayer", "mplayer"]
@@ -359,10 +386,17 @@ deny_binaries   = ["noctalia", "easyeffects", "speech-dispatcher", "sd_dummy", .
 
 ### Traps
 
+* **All matching is case-insensitive substring** — `music_hosts = ["music.youtube.com"]` matches any
+  URL *containing* it, `deny_binaries = ["pipewire"]` matches `pipewire-frontend`. That is contractual,
+  not an accident; `video_roles` used to be the one exact-matcher and is now substring like the rest.
 * **`media.role` for video is `Movie`, not `video`** — hence both values in `video_roles`.
 * **Many clients omit `application.process.binary`** (`pw-play` exposes only `application.name` and
   `node.name`), so match across all three fields, not just the binary.
-* **`browser_default = "video"`** means a browser playing *something* with no `xesam:url` keeps the
-  screen awake. Set it to `"unknown"` if you'd rather a missed video than an extra "stay awake".
+* **`browser_default` only applies to URL-less browsers**, and accepts exactly `"video"`, `"music"` or
+  `"unknown"`; any other value is a load-time warning and falls back to `"video"`. A browser playing
+  something with a URL that is not a music host is **video** regardless of `browser_default`.
+* **Rule values are validated at load** — a wrong-typed list or an unknown key warns and falls back to
+  the built-in default rather than crashing the daemon. `media-idle-bridge --once` exits non-zero when
+  any rule was rejected, so a typo shows up when you are actually looking.
 * **An app's own inhibitor cannot be overridden.** If a player inhibits idle itself, no policy can
   un-inhibit it; the bridge can only *add* inhibitors.

@@ -1,0 +1,19 @@
+# What Noctalia exports when the fragment also defines disabled and zero-timeout examples:
+# those behaviours are deliberately absent from the export (they are never registered), and
+# only the three effective behaviours are resolved. Pairs with a fragment that defines extra
+# `enabled = false` / `timeout = 0` blocks — their absence is not drift.
+
+[idle]
+behavior_order = ["dim", "screen-off", "lock"]
+
+[idle.behavior.dim]
+timeout = 50
+action = "command"
+
+[idle.behavior.screen-off]
+timeout = 70
+action = "screen_off"
+
+[idle.behavior.lock]
+timeout = 120
+action = "lock"

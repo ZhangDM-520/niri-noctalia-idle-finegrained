@@ -10,7 +10,7 @@ the user-facing syntax reference is [../MANUAL.md](../MANUAL.md); the chronologi
 
 | Interface | Implementations | Rule |
 | :-- | :-- | :-- |
-| `nri-idle`: `render` · `install` · `status` · `uninstall` | the CLI + its flags | The idle policy is a **native Noctalia fragment** (`config/idle.toml`). The CLI injects it; it never re-encodes it. |
+| `nri-idle`: `render` · `install` · `status` · `uninstall` · `paths` | the CLI + its flags | The idle policy is a **native Noctalia fragment** (`config/idle.toml`). The CLI injects it; it never re-encodes it. |
 | `media-idle-bridge`: `--config`, `--once`, `--debug`, SIGTERM + the rules file | the daemon | The rules file answers exactly one question: *is a **video** playing?* Music never inhibits. |
 
 Everything else — marker strings, splice internals, TOML validation, MPRIS/PipeWire plumbing — is
@@ -37,7 +37,43 @@ implementation and may change freely as long as the two interfaces keep their pr
   name, so a D-Bus inhibitor suppresses Noctalia's behaviours even though the mechanisms look
   unrelated. That is why the bridge holds *both* inhibitor kinds.
 
-## 3. Media classification: traps that were each hit once
+## 3. Interface contracts — what the tests pin
+
+The surface is declared, not implied; each line below is enforced by the suite.
+
+**CLI (`nri-idle`)**
+
+* **Exit codes.** `status`: 0 healthy (or formatting-only drift, reported as info) · 1 out of date ·
+  2 refused · 3 the shell could not be read · 4 the export is empty/unparseable (3 and 4 outrank 1).
+  `install`/`uninstall`: 0 ok · 1 reload failed · 2 refused (usage errors also exit 2).
+* **Flag × command applicability** lives in one `FLAG_APPLICABILITY` table: parser help, `main`'s
+  enforcement and the tests all read it. An inapplicable flag is a usage error, never silence.
+* **`paths` owns the installed layout** (`fragment`, `target`, `rules`, `bin_dir`, `unit`, `noctalia`
+  as `key=value` lines); `install.sh` consumes it and hardcodes no `.config/` path. Its `fragment` is
+  the **user-owned** location (explicit `--fragment` → `NRI_IDLE_FRAGMENT` →
+  `~/.config/nri-idle/idle.toml`): the checkout's `config/idle.toml` is a *source to seed from*,
+  never the reported location.
+* **Managed-block surgery is parse-verified.** Markers match as whole lines by stable prefix
+  (`# >>> nri-idle managed block` / `# <<< nri-idle managed block`), and edits happen only where both
+  sides parse (states: absent · intact · begin-only · end-only · interleaved · multiple ·
+  unparseable-body). Damage is refused by *every* command including `uninstall` — there is no
+  `--force`; a half-written block must never cost more user text. `--replace-idle` removals are
+  parse-verified before the write.
+* **Drift is three-state**: up to date · formatting-only (info, exit 0) · out of date (exit 1).
+  Byte-equality noise is not drift.
+
+**Daemon (`media-idle-bridge`)**
+
+* **`MediaSource` seam** (`snapshot()` / `start()` / `stop()`, with MPRIS and PipeWire adapters):
+  `--once` and the daemon run one decision path, and every verdict names the rule that matched.
+  dbus/GLib imports are lazy so the classification core imports under plain Python.
+* **Rules are validated at load**: wrong-typed values warn and fall back to the default
+  (`browser_default`'s domain is `video|music|unknown`), unknown keys warn and drop — a typo must
+  never crash-loop the daemon under `Restart=on-failure`. `--once` exits 1 when a rule was rejected.
+* **Classification precedence**: any video — MPRIS or the PipeWire backstop — inhibits; video beats
+  music; music alone never inhibits and never masks the backstop.
+
+## 4. Media classification: traps that were each hit once
 
 * **`media.role` for video is `Movie`, not `video`** (VLC). `video_roles` carries both.
 * **NetEase (Electron) has an empty `xesam:url`** and is matched as *music* only by Identity — it must
@@ -50,12 +86,17 @@ implementation and may change freely as long as the two interfaces keep their pr
 * **An app's own idle inhibitor cannot be removed**, only added to. The bridge can never make an
   inhibiting player leave the screen alone.
 
-## 4. Testing: how to verify, and what each suite can reach
+## 5. Testing: how to verify, and what each suite can reach
 
 ```bash
-python3 -m unittest discover -s tests      # 32 tests at the CLI interface, no display, no Noctalia
+python3 -m unittest discover -s tests      # 169 tests: CLI contract, media rules, install.sh layout
 ./tests/bridge-tests.sh                    # 15 live scenarios; needs a real niri/Noctalia session
 ```
+
+The unit suite is three files: `tests/test_nri_idle.py` (95, the CLI surface through `main(argv)`),
+`tests/test_media_rules.py` (56, the classification core — no display, no bus, no PipeWire), and
+`tests/test_install_layout.py` (16, drives `install.sh` itself). Synthetic export fixtures live in
+`tests/fixtures/exports/` (authored, never recorded user data).
 
 * The Python suite drives `nri-idle` with `FakeNoctalia` injected (`--noctalia`), so it can run
   anywhere — that seam (`RealNoctalia` / `FakeNoctalia`) is what keeps the suite honest and cheap.
@@ -70,8 +111,14 @@ python3 -m unittest discover -s tests      # 32 tests at the CLI interface, no d
   never parse a bus reply with `grep -oE '[0-9]+'`: a reply containing `uint32` yields `32`.
 * Do not let the owner's keystrokes race a timed probe; an idle test that measures "nothing fired"
   needs the seat untouched for the whole window.
+* **Noctalia Caffeine holds an idle inhibitor** (logind `idle` block *and* a Wayland one swayidle
+  sees), so with it on every "must not be inhibited" probe is a false FAIL and `BlockInhibited`
+  always contains `idle`. The suite now *refuses to run* in that state (exit 2, naming
+  `noctalia msg caffeine-disable`) instead of printing failures that blame the bridge. `niri`'s
+  `handle-power-key` inhibitor is harmless to the assertions. Found the hard way: 10 false FAILs on
+  an otherwise healthy bridge.
 
-## 5. Known upstream issue: lock wakes the screen (Noctalia ≤ 5.1.0)
+## 6. Known upstream issue: lock wakes the screen (Noctalia ≤ 5.1.0)
 
 * **Symptom**: `dim → screen off → lock` lights the panel at the lock and replays the chain.
 * **Cause**: `IdleManager::setSessionLocked()` re-armed every behaviour and ran the *resume* action of
@@ -88,7 +135,7 @@ python3 -m unittest discover -s tests      # 32 tests at the CLI interface, no d
 * **Evidence method** worth reusing: shorten the chain (10/15/20 s), watch `/sys/class/drm/*/dpms`,
   compare "dpms On at the lock" before and after. Two reproductions on demand before the fix.
 
-## 6. Decisions that should not be re-litigated without new evidence
+## 7. Decisions that should not be re-litigated without new evidence
 
 * **The fragment is the interface** (native Noctalia syntax), not flags or a GUI — deletion test:
   delete the CLI and the fragment is still a valid Noctalia config. See DESIGN.md.
@@ -101,11 +148,13 @@ python3 -m unittest discover -s tests      # 32 tests at the CLI interface, no d
   double-fire on the same idle stream.
 * **Fragment lives at `~/.config/nri-idle/idle.toml`**, resolved through an injected search path
   (explicit → `$NRI_IDLE_FRAGMENT` → installed → checkout). Guessing from the script path was wrong the
-  moment the tool was installed.
+  moment the tool was installed. Resolution may *fall through* to a checkout copy when acting on
+  whatever exists, but the **owned** location (what `paths` reports, what `install.sh` seeds) never
+  does — see the `paths` contract above.
 
-## 7. Release checklist
+## 8. Release checklist
 
-1. `python3 -m unittest discover -s tests` (32) and `./tests/bridge-tests.sh` (15, 0 indeterminate) —
+1. `python3 -m unittest discover -s tests` (169) and `./tests/bridge-tests.sh` (15, 0 indeterminate) —
    the latter needs a live session and leaves `media-idle-bridge` as it found it.
 2. `nri-idle status` on the host that just ran the tests: three behaviours, no drift.
 3. Bump `CHANGELOG.md`; the version story is "keep a Changelog" + SemVer.

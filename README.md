@@ -28,6 +28,14 @@ nri-idle status            # confirm what is now live
 If your Noctalia config already has hand-written idle behaviours, `install.sh` will refuse rather than
 guess, and tell you to re-run `./install.sh --replace-idle` (your config is backed up first).
 
+There are two install verbs and they have different scopes: `./install.sh` is the **machine
+install** — it lays down the binaries, the service and a seeded `~/.config/nri-idle/idle.toml`, then
+applies the policy once. `nri-idle install` is the **policy apply** — the everyday command you re-run
+after editing your fragment; it touches nothing but the managed block in your Noctalia config.
+`./install.sh --dry-run` is a faithful rehearsal: same checks, same refusals (remedy text and exit
+code included), zero writes — and every would-be write is printed as `dry-run: would …`, so a
+rehearsal and a real run are comparable line for line.
+
 Requirements: `python3` ≥ 3.11, `noctalia` on `PATH`, PipeWire (`pw-dump`). For the media bridge:
 `python-dbus`, `python-gobject`. Optional: `playerctl` (handy for inspecting MPRIS), `brightnessctl`
 (only if your fragment uses it, as the shipped one does).
@@ -38,7 +46,7 @@ Requirements: `python3` ≥ 3.11, `noctalia` on `PATH`, PipeWire (`pw-dump`). Fo
 | :-- | :-- |
 | `~/.config/nri-idle/idle.toml` | **Yours to edit.** The idle behaviours, in Noctalia syntax. Never overwritten by re-installing. |
 | `~/.config/noctalia/config.toml` | Your config, with a delimited `nri-idle managed block` spliced in. Everything else — comments, ordering, your other keys — is left byte-for-byte alone. |
-| `~/.local/bin/nri-idle` | The CLI (`render` · `install` · `status` · `uninstall`). |
+| `~/.local/bin/nri-idle` | The CLI (`render` · `install` · `status` · `uninstall` · `paths`). |
 | `~/.local/bin/media-idle-bridge` | The daemon that holds idle inhibitors while video plays. |
 | `~/.config/media-idle-bridge/config.toml` | The media rules (which players count as video, which hosts count as music). Created only if absent. |
 | `~/.config/systemd/user/media-idle-bridge.service` | Runs the bridge as part of your graphical session. |
@@ -54,7 +62,14 @@ nri-idle render            # preview the merged result, writes nothing
 nri-idle install           # validate, write, reload the running shell
 nri-idle status            # fragment vs. what the running shell actually resolved
 nri-idle uninstall         # remove the managed block, keep everything else
+nri-idle paths             # where everything lives (key=value lines)
 ```
+
+`install --dry-run` (and `uninstall --dry-run`) rehearses the real thing: same checks, same
+decisions, same refusals — including running Noctalia's validator on the candidate — zero writes to
+your files. A flag that makes no sense for a command is a usage error (exit 2), not silence. Exit
+codes: `status` 0 healthy · 1 out of date · 2 refused · 3 the shell could not be read · 4 the shell
+exports nothing; `install`/`uninstall` 0 ok · 1 reload failed · 2 refused. (MANUAL §8 has the table.)
 
 Add a stage by adding a block; change timings by changing `timeout`; keep something around switched
 off with `enabled = false`:
@@ -152,21 +167,24 @@ has the one-line stopgap.
 * **An app's own inhibitor cannot be overridden.** Some players inhibit idle themselves; the bridge can
   only *add* inhibitors, never remove someone else's. Music played in a browser that inhibits for
   audio-only playback will keep the screen awake — that is the app's choice, not this tool's.
-* **`browser_default = "video"`.** A browser playing something with no `xesam:url` is treated as video
-  (keeping the screen awake) because a missed video is worse than an extra stay-awake. Switch it to
-  `"unknown"` in the rules file to invert that trade-off.
+* **`browser_default` applies only to URL-less browsers.** A browser playing something with no
+  `xesam:url` is treated per `browser_default` (`"video"` by default, keeping the screen awake, because
+  a missed video is worse than an extra stay-awake) and accepts `"video"`, `"music"` or `"unknown"`; a
+  browser playing something *with* a URL that is not a music host is video regardless. Everything the
+  rules file accepts is validated at load, with warnings and safe fallbacks — see MANUAL §10.
 * **The `.NET`/Electron MPRIS mess is real.** Apps expose wildly different identities; the shipped
   tables cover the cases measured here (NetEase, Zen, mpv, VLC) and are meant to be edited.
 
 ## Layout
 
 ```
-bin/nri-idle               the CLI: render · install · status · uninstall
+bin/nri-idle               the CLI: render · install · status · uninstall · paths
 bin/media-idle-bridge      the media → inhibitor translator
 config/idle.toml           the fragment that gets injected (your interface)
 config/media-idle-rules.toml   media classification rules
 systemd/media-idle-bridge.service
 tests/test_nri_idle.py     interface tests, Noctalia injected
+tests/test_media_rules.py  rules + decision-core unit suite (no live session needed)
 tests/bridge-tests.sh      live media classification suite
 docs/DESIGN.md             why the seams are where they are
 docs/MEMORY.md             measured facts, traps, and decisions not to re-litigate

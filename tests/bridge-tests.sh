@@ -20,14 +20,16 @@ MARK=/tmp/swayidle-fired
 BRIDGE_LOG=/tmp/bridge-under-test.log
 PROBE_LOG=/tmp/swayidle-check.log
 
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-export XDG_RUNTIME_DIR=/run/user/1000
-export WAYLAND_DISPLAY=wayland-1
+# Session identity comes from the environment; fall back to this machine's usual values so the
+# suite is not uid-1000 / wayland-1-coupled.
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
 
 # Kill stray fake players from earlier runs without matching this script's own command line
 # (pgrep -f would match the subshell that contains the pattern).
 for d in /proc/[0-9]*; do
-  cmd=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null) || continue
+  cmd=$(tr '\0' ' ' 2>/dev/null <"$d/cmdline") || continue
   case "$cmd" in "python3 $FAKE"*) kill "${d#/proc/}" 2>/dev/null ;; esac
 done
 sleep 1
@@ -102,7 +104,7 @@ service_was_active=$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)
 cleanup() {
   [ -n "${BRIDGE_PID:-}" ] && kill "$BRIDGE_PID" 2>/dev/null
   for d in /proc/[0-9]*; do
-    cmd=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null) || continue
+    cmd=$(tr '\0' ' ' 2>/dev/null <"$d/cmdline") || continue
     case "$cmd" in "python3 $FAKE"*) kill "${d#/proc/}" 2>/dev/null ;; esac
   done
   if [ "$service_was_active" = "active" ]; then
@@ -114,6 +116,23 @@ trap cleanup EXIT
 
 systemctl --user stop "$SERVICE" 2>/dev/null
 [ "$service_was_active" = "active" ] && echo "note  stopped $SERVICE for this run; restarted at the end"
+
+# Exclusive control of the inhibitor path is a precondition, not an assumption. Any *other* idle
+# inhibitor (Noctalia's Caffeine mode is the one that bit here) poisons both signals this suite
+# asserts on — swayidle reports "idle inhibitor found" and logind's BlockInhibited contains "idle" —
+# so every "must not be inhibited" check would be a false FAIL. Refuse to run instead of lying.
+foreign_idle_inhibitor() {   # 0 when something besides the bridge holds an idle inhibitor
+  [ "$(probe)" = "inhibited" ] && return 0
+  case ":$(block):" in *:idle:*) return 0 ;; esac
+  return 1
+}
+if foreign_idle_inhibitor; then
+  echo "refused: something other than the media bridge is holding an idle inhibitor" >&2
+  echo "  the likely culprit is Noctalia Caffeine: 'noctalia msg caffeine-disable', re-enable after" >&2
+  echo "  (check others with: systemd-inhibit --list)" >&2
+  exit 2
+fi
+
 "$BRIDGE" --debug >"$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 sleep 2

@@ -1,0 +1,32 @@
+# Same resolved behaviours as defaults-filled.toml, plus keys Noctalia may gain (or already
+# has) that this toolset knows nothing about. Unknown keys must be ignored by normalisation,
+# on the [idle] table and inside behaviours alike.
+
+[idle]
+behavior_order = ["dim", "screen-off", "lock"]
+pre_action_fade_seconds = 0.0
+nudge_seconds = 3.5
+experimental_kiosk_mode = false
+
+[idle.behavior.dim]
+enabled = true
+timeout = 50
+locked_timeout = 0
+action = "command"
+command = "brightnessctl -s && brightnessctl set 30%"
+resume_command = "brightnessctl -r"
+fade = true
+
+[idle.behavior.screen-off]
+enabled = true
+timeout = 70
+locked_timeout = 0
+action = "screen_off"
+extra_option = "ignored"
+
+[idle.behavior.lock]
+enabled = true
+timeout = 120
+locked_timeout = 0
+action = "lock"
+notify_before = 5

@@ -1,13 +1,29 @@
 # media-idle-bridge rules - video inhibits idle, music never does.
 #
-# Classification precedence (see decide() in ~/.local/bin/media-idle-bridge):
-#   1. a Playing MPRIS player whose Identity matches `music_players`  -> music (never inhibits)
-#   2. a Playing MPRIS player whose Identity matches `video_players`  -> video (inhibits)
-#   3. a Playing browser -> music if xesam:url matches a `music_hosts` entry, otherwise
-#      `browser_default` when the player exposes no URL at all
-#   4. otherwise the PipeWire backstop: a *running* Stream/Output/Audio node whose
-#      application.process.binary matches `video_binaries`, or whose media.role matches
-#      `video_roles`, and which does not match `deny_binaries`
+# Matching is case-insensitive SUBSTRING everywhere (a value matches when a rule entry occurs
+# inside it): `deny_binaries = ["pipewire"]` deliberately matches "pipewire-frontend", and
+# `video_roles` works the same way now (it used to be exact-match).  Values are validated when
+# loaded: a wrong-typed value falls back to that key's default with a warning, unknown keys are
+# dropped with a warning, and a bad or missing file yields the built-in defaults - a mis-edited
+# file must never crash-loop the daemon.  An empty list is valid and disables that rule.
+#
+# Per-player classification of a Playing MPRIS player (first match wins):
+#   1. Identity matches `music_players`  -> music (never inhibits)
+#   2. Identity matches `video_players`  -> video (inhibits)
+#   3. Identity or bus name matches `browser_players` -> decided by xesam:url: a `music_hosts`
+#      match is music, ANY other URL is video (code rule), and only a browser with no URL at
+#      all falls through to `browser_default`.  `browser_default` domain: "video", "music" or
+#      "unknown"; anything else warns and falls back to "video" (a missed video is worse than
+#      an extra stay-awake).
+#
+# Cross-player rule: ANY video inhibits - an MPRIS video OR a PipeWire backstop stream below.
+# Music never inhibits AND never masks the backstop (a music player plus an MPRIS-less ffplay
+# video must still keep the screen awake); when a music and a video player coexist, video wins.
+#
+# PipeWire backstop - the allow-list for players without MPRIS: a *running* Stream/Output node
+# whose application.process.binary / application.name / node.name matches `video_binaries`, or
+# whose media.role matches `video_roles`, and which does not match `deny_binaries` (deny
+# subtracts only - it never gates the MPRIS rules).
 #
 # Measured hazards this layout exists for (2026-09-21):
 #   * Noctalia's own `noctalia-sound` UI stream sits in state=running permanently, and the

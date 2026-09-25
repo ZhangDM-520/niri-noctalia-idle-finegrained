@@ -4,18 +4,21 @@
 # Interface: this script is the *only* entry point you need to remember.
 #   ./install.sh                 install everything (idle behaviours + media bridge)
 #   ./install.sh --no-bridge     idle behaviours only, no media awareness
-#   ./install.sh --dry-run       say what would happen; write nothing
+#   ./install.sh --dry-run       rehearse the machine install; write nothing
 #   ./install.sh --replace-idle  take over idle tables your config already defines
 #
-# It is idempotent: re-running it copies the same files, never overwrites a rules file you have
-# edited, and re-splices the same managed block. Every decision about *which* idle behaviours you
-# get is made by config/idle.toml and by `nri-idle` — not here.
+# Where anything lives is not decided here: `nri-idle paths` owns the installed layout and
+# every location below comes from it. --dry-run rehearses the whole install — same checks,
+# same refusals (remedy text and exit code included), zero writes — and prints every
+# would-be write as "dry-run: would ...".
+#
+# It is idempotent: re-running it copies the same files, never overwrites a rules file you
+# have edited, and re-splices the same managed block. Every decision about *which* idle
+# behaviours you get is made by config/idle.toml and by `nri-idle` — not here.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$HOME/.local/bin"
-RULES_DIR="$HOME/.config/media-idle-bridge"
-UNIT_DIR="$HOME/.config/systemd/user"
+NRI="$REPO/bin/nri-idle"
 WITH_BRIDGE=1
 DRY_RUN=0
 REPLACE_IDLE=0
@@ -25,14 +28,65 @@ for arg in "$@"; do
     --no-bridge) WITH_BRIDGE=0 ;;
     --dry-run) DRY_RUN=1 ;;
     --replace-idle) REPLACE_IDLE=1 ;;
-    -h|--help) sed -n '2,8p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 64 ;;
   esac
 done
 
 say()  { printf '  %s\n' "$*"; }
 step() { printf '\n▸ %s\n' "$*"; }
-run()  { if [ "$DRY_RUN" = 1 ]; then say "dry-run: $*"; else "$@"; fi; }
+# One seam for every write: `act` prints the same sentence either as a fact (after doing
+# it) or as "dry-run: would ..." (doing nothing at all). Same sentence minus the prefix is
+# what makes a rehearsal comparable to a run, line for line.
+act() {
+  local desc="$1"; shift
+  if [ "$DRY_RUN" = 1 ]; then
+    say "dry-run: would $desc"
+  else
+    "$@"
+    say "$desc"
+  fi
+}
+
+# ── the layout: owned by `nri-idle paths`, echoed here so the run is auditable ───────────
+step "resolving the installed layout (nri-idle paths)"
+if ! PATHS_OUT="$("$NRI" paths)"; then
+  echo "could not run 'nri-idle paths' — python3 >= 3.11 is required to run nri-idle" >&2
+  exit 1
+fi
+FRAGMENT=""; TARGET=""; RULES=""; BIN_DIR=""; UNIT=""; NOCTALIA=""
+while IFS= read -r line; do
+  key="${line%%=*}"
+  value="${line#*=}"
+  case "$key" in
+    fragment) FRAGMENT="$value" ;;
+    target)   TARGET="$value" ;;
+    rules)    RULES="$value" ;;
+    bin_dir)  BIN_DIR="$value" ;;
+    unit)     UNIT="$value" ;;
+    noctalia) NOCTALIA="$value" ;;
+  esac
+done <<< "$PATHS_OUT"
+if [ -z "$FRAGMENT" ] || [ -z "$TARGET" ] || [ -z "$RULES" ] ||
+   [ -z "$BIN_DIR" ] || [ -z "$UNIT" ] || [ -z "$NOCTALIA" ]; then
+  echo "nri-idle paths did not report the whole installed layout" >&2
+  exit 1
+fi
+say "fragment : $FRAGMENT"
+say "target   : $TARGET"
+say "rules    : $RULES"
+say "bin_dir  : $BIN_DIR"
+say "unit     : $UNIT"
+say "noctalia : $NOCTALIA"
+if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then
+  printf '  warning: the unit hardcodes %%h/.local/bin/media-idle-bridge but bin_dir is %s\n' "$BIN_DIR" >&2
+  printf '  warning: the unit is not templated — the bridge would not start from bin_dir\n' >&2
+fi
+if [ "$FRAGMENT" = "$REPO/config/idle.toml" ]; then
+  # Only reachable when NRI_IDLE_FRAGMENT (or the resolver) points at the shipped source
+  # itself: then the "user fragment" is the checkout copy, and there is nothing to seed.
+  say "fragment is the shipped copy in this checkout — nothing will be seeded"
+fi
 
 step "checking dependencies"
 PY=""
@@ -45,8 +99,8 @@ done
 [ -n "$PY" ] || { echo "python3 >= 3.11 is required (tomllib)" >&2; exit 1; }
 say "python: $($PY --version 2>&1)"
 
-command -v noctalia >/dev/null 2>&1 || { echo "noctalia not found on PATH" >&2; exit 1; }
-say "noctalia: $(noctalia --version 2>&1 | head -1)"
+command -v "$NOCTALIA" >/dev/null 2>&1 || { echo "noctalia not found on PATH" >&2; exit 1; }
+say "noctalia: $("$NOCTALIA" --version 2>&1 | head -1)"
 
 if [ "$WITH_BRIDGE" = 1 ]; then
   missing=""
@@ -71,13 +125,13 @@ if [ "$WITH_BRIDGE" = 1 ]; then
 fi
 
 step "installing the tools"
-run install -d "$BIN" "$RULES_DIR" "$UNIT_DIR" "$HOME/.config/nri-idle"
-run install -m 0755 "$REPO/bin/nri-idle" "$BIN/nri-idle"
-say "$BIN/nri-idle"
+act "create dirs: $BIN_DIR $(dirname "$FRAGMENT") $(dirname "$RULES") $(dirname "$UNIT")" \
+  install -d "$BIN_DIR" "$(dirname "$FRAGMENT")" "$(dirname "$RULES")" "$(dirname "$UNIT")"
+act "install $REPO/bin/nri-idle -> $BIN_DIR/nri-idle" \
+  install -m 0755 "$REPO/bin/nri-idle" "$BIN_DIR/nri-idle"
 
-# The fragment is the interface the user edits, so it lives in their config dir and is never
-# overwritten: their edits are the point. A diff is reported instead.
-FRAGMENT="$HOME/.config/nri-idle/idle.toml"
+# The fragment is the interface the user edits, so it is never overwritten: their edits are
+# the point. A diff is reported instead.
 if [ -f "$FRAGMENT" ]; then
   if cmp -s "$FRAGMENT" "$REPO/config/idle.toml"; then
     say "$FRAGMENT is up to date"
@@ -86,58 +140,71 @@ if [ -f "$FRAGMENT" ]; then
     say "    diff -u $FRAGMENT $REPO/config/idle.toml"
   fi
 else
-  run install -m 0644 "$REPO/config/idle.toml" "$FRAGMENT"
-  say "$FRAGMENT (edit this to change your idle policy)"
+  act "create $FRAGMENT (from the shipped config — edit this to change your idle policy)" \
+    install -m 0644 "$REPO/config/idle.toml" "$FRAGMENT"
 fi
 
 if [ "$WITH_BRIDGE" = 1 ]; then
-  run install -m 0755 "$REPO/bin/media-idle-bridge" "$BIN/media-idle-bridge"
-  run install -m 0644 "$REPO/systemd/media-idle-bridge.service" "$UNIT_DIR/media-idle-bridge.service"
-  if [ -f "$RULES_DIR/config.toml" ]; then
-    say "$RULES_DIR/config.toml exists — left alone (see config/media-idle-rules.toml for updates)"
+  act "install $REPO/bin/media-idle-bridge -> $BIN_DIR/media-idle-bridge" \
+    install -m 0755 "$REPO/bin/media-idle-bridge" "$BIN_DIR/media-idle-bridge"
+  act "install $REPO/systemd/media-idle-bridge.service -> $UNIT" \
+    install -m 0644 "$REPO/systemd/media-idle-bridge.service" "$UNIT"
+  if [ -f "$RULES" ]; then
+    say "$RULES exists — left alone (see config/media-idle-rules.toml for updates)"
   else
-    run install -m 0644 "$REPO/config/media-idle-rules.toml" "$RULES_DIR/config.toml"
-    say "$RULES_DIR/config.toml"
+    act "create $RULES (from the shipped rules — see config/media-idle-rules.toml for updates)" \
+      install -m 0644 "$REPO/config/media-idle-rules.toml" "$RULES"
   fi
 fi
 
 step "installing the idle behaviours"
-# Run the repo copy of the tool, not the one just installed: in --dry-run nothing has been
-# copied yet. The installed copy is exercised at the end, so a broken install still shows up.
-NRI="$REPO/bin/nri-idle"
+# One argument list for both the rehearsal and the run: --replace-idle and --dry-run ride
+# along or not, and nothing else differs. The repo copy of the tool is the one driven here;
+# the installed copy is exercised at the end, so a broken install still shows up.
+INSTALL_ARGS=(install --target "$TARGET" --noctalia "$NOCTALIA")
+if [ "$REPLACE_IDLE" = 1 ]; then
+  INSTALL_ARGS+=(--replace-idle)
+fi
 if [ "$DRY_RUN" = 1 ]; then
-  "$NRI" install --dry-run --target "$HOME/.config/noctalia/config.toml"
-else
-  # Default to the safe path: if a hand-written idle config is already there, `nri-idle` refuses
-  # and says exactly what to do, rather than deleting the user's tables on a blind first run.
-  extra=""
-  [ "$REPLACE_IDLE" = 1 ] && extra="--replace-idle"
-  if ! "$NRI" install ${extra:+"$extra"} --target "$HOME/.config/noctalia/config.toml"; then
-    cat >&2 <<'EOF'
+  INSTALL_ARGS+=(--dry-run)
+fi
+# The refusal handler is the same on both paths: `nri-idle` says what is wrong, the remedy
+# below says how to proceed, and the verdict (its exit code) is kept.
+rc=0
+"$NRI" "${INSTALL_ARGS[@]}" || rc=$?
+if [ "$rc" -eq 2 ]; then
+  cat >&2 <<'EOF'
 
 Re-run with --replace-idle to have this tool take over the idle tables that are already in your
 config (they are backed up first):
 
     ./install.sh --replace-idle
 EOF
-    exit 2
-  fi
+  exit 2
+elif [ "$rc" -ne 0 ]; then
+  # Not a refusal (a FAILED reload, for one, is exit 1): the tool already said why.
+  exit "$rc"
 fi
 
 if [ "$WITH_BRIDGE" = 1 ]; then
   step "enabling the media bridge"
-  run systemctl --user daemon-reload
-  run systemctl --user enable --now media-idle-bridge.service
+  act "systemctl --user daemon-reload" systemctl --user daemon-reload
+  act "systemctl --user enable --now media-idle-bridge.service" \
+    systemctl --user enable --now media-idle-bridge.service
 fi
 
 step "done"
-if [ "$DRY_RUN" = 0 ]; then
+if [ "$DRY_RUN" = 1 ]; then
+  say "installed-copy verification: skipped (dry run)"
+else
   # Prove the *installed* copy runs, not just the repo one.
-  if "$BIN/nri-idle" status >/dev/null 2>&1; then
-    say "installed copy verified: $BIN/nri-idle status"
+  if "$BIN_DIR/nri-idle" status >/dev/null 2>&1; then
+    say "installed-copy verification: $BIN_DIR/nri-idle status — ok"
   else
-    printf '  warning: the installed copy did not report status — run %s status\n' "$BIN/nri-idle" >&2
+    printf '  warning: the installed copy did not report status — run %s status\n' "$BIN_DIR/nri-idle" >&2
   fi
 fi
 say "check the whole picture with: nri-idle status"
-[ "$WITH_BRIDGE" = 1 ] && say "watch the bridge with:    journalctl --user -u media-idle-bridge -f"
+if [ "$WITH_BRIDGE" = 1 ]; then
+  say "watch the bridge with:    journalctl --user -u media-idle-bridge -f"
+fi

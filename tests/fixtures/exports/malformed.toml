@@ -1,0 +1,5 @@
+# Garbage on the wire: an export that is not TOML at all (a daemon error page, a truncated
+# pipe). Must degrade to "not running", exactly like the empty export above.
+
+[idle
+this is not toml = = =

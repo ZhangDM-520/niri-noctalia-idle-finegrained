@@ -1,0 +1,34 @@
+# Synthetic `noctalia config export full` body: the three example behaviours with every
+# default written out (`enabled`, `locked_timeout`, `pre_action_fade_seconds`). Authored for
+# tests — no recorded user data. The [shell]/[keybinds] tables pin that the export side
+# carries the whole config and is never subject to the fragment's [idle]-only scoping rule.
+
+[shell]
+polkit_agent = true
+
+[keybinds]
+alt-return = "spawn:foot"
+
+[idle]
+behavior_order = ["dim", "screen-off", "lock"]
+pre_action_fade_seconds = 0.0
+
+[idle.behavior.dim]
+enabled = true
+timeout = 50
+locked_timeout = 0
+action = "command"
+command = "brightnessctl -s && brightnessctl set 30%"
+resume_command = "brightnessctl -r"
+
+[idle.behavior.screen-off]
+enabled = true
+timeout = 70
+locked_timeout = 0
+action = "screen_off"
+
+[idle.behavior.lock]
+enabled = true
+timeout = 120
+locked_timeout = 0
+action = "lock"

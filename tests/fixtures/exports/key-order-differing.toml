@@ -1,0 +1,27 @@
+# Same resolved behaviours as defaults-filled.toml, but the tables come in a different order
+# and the keys inside them are shuffled. Normalisation must not care — a re-serialised export
+# that reorders things is not drift.
+
+[idle.behavior.lock]
+locked_timeout = 0
+action = "lock"
+timeout = 120
+enabled = true
+
+[idle]
+pre_action_fade_seconds = 0.0
+behavior_order = ["dim", "screen-off", "lock"]
+
+[idle.behavior.screen-off]
+timeout = 70
+action = "screen_off"
+enabled = true
+locked_timeout = 0
+
+[idle.behavior.dim]
+action = "command"
+resume_command = "brightnessctl -r"
+command = "brightnessctl -s && brightnessctl set 30%"
+enabled = true
+locked_timeout = 0
+timeout = 50

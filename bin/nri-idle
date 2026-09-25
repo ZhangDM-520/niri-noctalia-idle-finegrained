@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """nri-idle — install and inspect a Noctalia idle-behaviour fragment.
 
-The interface is deliberately four commands wide, with one behaviour behind each:
+The interface is deliberately five commands wide, with one behaviour behind each:
 
     nri-idle render      the merged target file, printed. Writes nothing.
     nri-idle install     splice the fragment into the target, validate, reload.
     nri-idle status      what the fragment asks for vs. what Noctalia is running.
     nri-idle uninstall   remove the managed block and nothing else.
+    nri-idle paths       the installed layout, as key=value lines for scripts to consume.
 
 Everything a caller must know:
 
@@ -21,7 +22,23 @@ Everything a caller must know:
   * The candidate is validated by `noctalia config validate <candidate>` *before* the target
     is written. A bad fragment therefore leaves the target untouched — the failure mode is
     "nothing happened", never "config broken".
-  * Exactly one marker present is a corrupt state and is refused; the file is never guessed at.
+  * The managed block is located once over the document as a value (`ManagedBlock`) and its
+    markers are recognised whole-line, by stable prefix. Every damage state — half-present,
+    doubled, out of order, body that will not parse — is refused with a remedy; the file is
+    never guessed at. Blocks written by older versions (their BEGIN line carried a repo-layout
+    hint) stay valid, because the prefix is what identifies a marker.
+  * Every write is verified by parsing before it can happen: the result must be valid TOML and
+    identical to the original outside `[idle]`. That check is what stands between a
+    marker-lookalike line inside a multi-line string and the user's own data.
+  * `status` reports the managed block three ways — up to date, formatting only (informational,
+    not drift), out of date. Only `status` says any of this; the written bytes stay verbatim
+    either way.
+  * Exit codes are the verdict, one class per kind of failure: `status` exits 0 healthy,
+    1 drift, 2 refused, 3 the shell could not be read at all, 4 the shell answers but exports
+    no idle behaviours. `install`/`uninstall` exit 0, 1 when the reload step failed, 2 refused.
+  * Which flag applies to which command is declared once (`FLAG_APPLICABILITY`) and enforced
+    before dispatch: a flag outside its commands is a usage error (exit 2), never a silently
+    ignored argument.
   * `noctalia` itself is a dependency of this program, so it is injected: `RealNoctalia` for
     production, `FakeNoctalia` in tests. No test needs the shell installed.
 """
@@ -44,6 +61,8 @@ HERE = Path(__file__).resolve().parent
 FRAGMENT_NAME = "idle.toml"
 DEFAULT_TARGET = Path.home() / ".config" / "noctalia" / "config.toml"
 DEFAULT_RULES = Path.home() / ".config" / "media-idle-bridge" / "config.toml"
+DEFAULT_BIN_DIR = Path.home() / ".local" / "bin"
+DEFAULT_UNIT = Path.home() / ".config" / "systemd" / "user" / "media-idle-bridge.service"
 
 
 def fragment_candidates(script_dir: Path, home: Path, env: str | None) -> list[Path]:
@@ -70,11 +89,21 @@ def resolve_fragment(
     return candidates[0]
 
 
+def owned_fragment(
+    script_dir: Path, home: Path, env: str | None, explicit: Path | None = None
+) -> Path:
+    """Where the user's fragment lives or should be created.
+
+    A checkout copy is a *source* to seed from, never the answer: on a fresh machine
+    `paths` must report the location install.sh will create, not the shipped file it
+    happens to be run from."""
+    if explicit is not None:
+        return explicit
+    return fragment_candidates(script_dir, home, env)[0]
+
+
 DEFAULT_FRAGMENT = resolve_fragment(HERE, Path.home(), os.environ.get("NRI_IDLE_FRAGMENT"))
-
-BEGIN = "# >>> nri-idle managed block — do not edit here; edit config/idle.toml in the repo, then re-run 'nri-idle install' >>>"
-END = "# <<< nri-idle managed block <<<"
-
+OWNED_FRAGMENT = owned_fragment(HERE, Path.home(), os.environ.get("NRI_IDLE_FRAGMENT"))
 
 class Refused(Exception):
     """The input cannot be acted on without risking the user's file."""
@@ -83,59 +112,135 @@ class Refused(Exception):
 # ── the Noctalia port ────────────────────────────────────────────────────────────────────
 
 
+EXPORT_OK = "ok"
+EXPORT_NOT_FOUND = "not_found"
+EXPORT_TIMEOUT = "timeout"
+EXPORT_FAILED = "failed"
+EXPORT_UNPARSEABLE = "unparseable"
+EXPORT_EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    """What `noctalia config export full` actually returned, classified once, at the port.
+
+    The port's contract is raw bytes + outcome; this is the typed form of that pair. The
+    kind is what callers branch on — `""` used to be the sentinel for every failure at once,
+    so `status` could not tell "Noctalia is not installed" from "nothing is configured".
+    """
+
+    kind: str     # one of the EXPORT_* constants
+    text: str     # the raw export; only meaningful when kind == EXPORT_OK
+    detail: str   # the binary's own words, for the failure kinds
+
+
+def export_outcome(rc: int, raw: bytes) -> ExportResult:
+    """Raw bytes + outcome → the typed result. One place decides every kind, so the port
+    and its test double cannot drift apart about what a failure means."""
+    detail = raw.decode("utf-8", "replace").strip()
+    if rc == 127:
+        return ExportResult(EXPORT_NOT_FOUND, "", detail)
+    if rc == 124:
+        return ExportResult(EXPORT_TIMEOUT, "", detail)
+    if rc != 0:
+        return ExportResult(EXPORT_FAILED, "", detail)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        return ExportResult(EXPORT_UNPARSEABLE, "", f"not UTF-8: {err}")
+    if not text.strip():
+        return ExportResult(EXPORT_EMPTY, "", detail)
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        return ExportResult(EXPORT_UNPARSEABLE, "", str(err))
+    if not behaviors_of(doc.get("idle", {})):
+        # The shell answered, but named no behaviours at all: distinct from "no shell answering".
+        return ExportResult(EXPORT_EMPTY, "", detail)
+    return ExportResult(EXPORT_OK, text, detail)
+
+
 class RealNoctalia:
     """Adapter for the real `noctalia` binary."""
 
     def __init__(self, binary: str = "noctalia") -> None:
         self.binary = binary
 
-    def _run(self, args: list[str]) -> tuple[int, str]:
+    def _run(self, args: list[str]) -> tuple[int, bytes]:
+        """Raw bytes + outcome: 127 means the binary is missing, 124 that it hung."""
         try:
-            p = subprocess.run(
-                [self.binary, *args], capture_output=True, text=True, timeout=30
-            )
+            p = subprocess.run([self.binary, *args], capture_output=True, timeout=30)
         except FileNotFoundError:
-            return 127, f"{self.binary}: not found"
+            return 127, f"{self.binary}: not found".encode("utf-8")
         except subprocess.TimeoutExpired:
-            return 124, f"{self.binary} {' '.join(args)}: timed out"
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+            return 124, f"{self.binary} {' '.join(args)}: timed out".encode("utf-8")
+        return p.returncode, (p.stdout or b"") + (p.stderr or b"")
 
     def validate(self, candidate: Path) -> tuple[bool, str]:
-        rc, out = self._run(["config", "validate", str(candidate)])
-        return rc == 0, out.strip()
+        rc, raw = self._run(["config", "validate", str(candidate)])
+        return rc == 0, raw.decode("utf-8", "replace").strip()
 
     def reload(self) -> tuple[bool, str]:
-        rc, out = self._run(["msg", "config-reload"])
-        return rc == 0, out.strip()
+        rc, raw = self._run(["msg", "config-reload"])
+        return rc == 0, raw.decode("utf-8", "replace").strip()
 
-    def exported_idle(self) -> str:
-        rc, out = self._run(["config", "export", "full"])
-        return out if rc == 0 else ""
+    def exported_idle(self) -> ExportResult:
+        rc, raw = self._run(["config", "export", "full"])
+        return export_outcome(rc, raw)
 
 
 class FakeNoctalia:
-    """Test adapter: records instead of executing, and can be told to reject a candidate."""
+    """Test adapter: records instead of executing, and can be told to fail on demand.
 
-    def __init__(self, validate_ok: bool = True, reload_ok: bool = True, export: str = "") -> None:
+    `export_mode` names an `ExportResult` kind so tests can pin each failure class;
+    `export` is the text for the `ok` mode. The counters stay because the commands'
+    ordering — validate before write, reload after — is exactly what the tests watch."""
+
+    EXPORT_MODES = (
+        EXPORT_OK, EXPORT_NOT_FOUND, EXPORT_TIMEOUT, EXPORT_FAILED,
+        EXPORT_UNPARSEABLE, EXPORT_EMPTY,
+    )
+
+    def __init__(
+        self,
+        validate_ok: bool = True,
+        reload_ok: bool = True,
+        export: str = "",
+        export_mode: str = EXPORT_OK,
+        validate_mode: str = "ok",
+        validate_message: str = "fake: invalid",
+    ) -> None:
+        if export_mode not in self.EXPORT_MODES:
+            raise ValueError(f"export_mode must be one of {self.EXPORT_MODES}")
         self.validate_ok = validate_ok
         self.reload_ok = reload_ok
         self.export = export
+        self.export_mode = export_mode
+        self.validate_mode = validate_mode
+        self.validate_message = validate_message
         self.validated: list[Path] = []
         self.reloaded = 0
 
     def validate(self, candidate: Path) -> tuple[bool, str]:
         self.validated.append(candidate)
-        return self.validate_ok, "fake: ok" if self.validate_ok else "fake: invalid"
+        ok = self.validate_ok and self.validate_mode != "fail"
+        return ok, "fake: ok" if ok else self.validate_message
 
     def reload(self) -> tuple[bool, str]:
         self.reloaded += 1
         return self.reload_ok, "fake: reloaded"
 
-    def exported_idle(self) -> str:
-        return self.export
+    def exported_idle(self) -> ExportResult:
+        if self.export_mode == EXPORT_OK:
+            return ExportResult(EXPORT_OK, self.export, "fake: ok")
+        return ExportResult(self.export_mode, "", f"fake: {self.export_mode}")
 
 
-# ── behaviour: pure, then effectful ──────────────────────────────────────────────────────
+# ── normalisation: pure, beside the port ─────────────────────────────────────────────────
+#
+# The port's contract is raw bytes from the binary; making sense of them is ours. One
+# dict→Behavior normaliser serves the fragment and the export alike, so the two sides can
+# never disagree about defaults, `enabled` or a missing timeout.
 
 
 @dataclass(frozen=True)
@@ -156,30 +261,8 @@ class Behavior:
         return f"{self.name:<14} {self.action:<16} {self.timeout:g}s{lock}{off}"
 
 
-def read_fragment(path: Path) -> str:
-    """Read and vet the fragment. Raises Refused with a fixable message."""
-    if not path.is_file():
-        raise Refused(f"fragment not found: {path}")
-    text = path.read_text(encoding="utf-8")
-    try:
-        doc = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as err:
-        raise Refused(f"{path} is not valid TOML: {err}") from err
-
-    stray = [k for k in doc if k != "idle"]
-    if stray:
-        raise Refused(
-            f"{path} defines {', '.join('[' + s + ']' for s in stray)} outside [idle]. "
-            "This block is spliced verbatim into the user's config, so unrelated tables "
-            "would override unrelated keys. Keep the fragment to idle only."
-        )
-    if not doc.get("idle", {}).get("behavior"):
-        raise Refused(f"{path} defines no [idle.behavior.*] entries")
-    return text
-
-
-def behaviors(fragment_text: str) -> list[Behavior]:
-    idle = tomllib.loads(fragment_text).get("idle", {})
+def behaviors_of(idle: dict) -> list[Behavior]:
+    """The one normaliser: a parsed `[idle]` table → Behaviours, defaults filled in."""
     out = []
     for name, spec in (idle.get("behavior") or {}).items():
         out.append(
@@ -194,18 +277,243 @@ def behaviors(fragment_text: str) -> list[Behavior]:
     return out
 
 
-def warnings(fragment_text: str) -> list[str]:
+def normalise_export(text: str) -> list[Behavior]:
+    """Behaviours as Noctalia resolved them — proof about the *running* config, not the file.
+
+    Consumes the text half of an `ExportResult` and stays deliberately lenient: the port's
+    edge (`export_outcome`) classifies missing, empty and unparseable exports, this only
+    turns readable text into behaviours.
+    """
+    if not text.strip():
+        return []
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return []
+    return behaviors_of(doc.get("idle", {}))
+
+
+def effective(behaviors_: list[Behavior]) -> list[Behavior]:
+    """The behaviours Noctalia actually registers: enabled, with a timeout that can fire.
+
+    Disabled blocks, and blocks whose only timeout is 0, are deliberately absent from
+    `noctalia config export full` — treating that as drift would cry wolf on every
+    example you keep switched off. This is policy, not parsing: it stays out of both
+    normalisers.
+    """
+    return [b for b in behaviors_ if b.enabled and (b.timeout > 0 or b.locked_timeout > 0)]
+
+
+# ── the fragment: parsed once per command, then threaded through ─────────────────────────
+
+
+@dataclass(frozen=True)
+class ParsedFragment:
+    """The idle fragment, vetted and normalised once. The commands pass this around instead
+    of re-reading and re-parsing the file."""
+
+    text: str                        # exactly as written — the bytes that get spliced
+    doc: dict                        # the parsed document; drift checks compare against it
+    behaviors: tuple[Behavior, ...]
+    warnings: tuple[str, ...]
+
+
+def warnings_of(idle: dict, behaviors_: list[Behavior]) -> list[str]:
     """Things that are legal but almost certainly typos."""
-    idle = tomllib.loads(fragment_text).get("idle", {})
     defined = set((idle.get("behavior") or {}).keys())
     out = []
     for name in idle.get("behavior_order", []):
         if name not in defined:
             out.append(f"behavior_order names '{name}', which no behaviour defines (ignored by Noctalia)")
-    for b in behaviors(fragment_text):
+    for b in behaviors_:
         if b.timeout == 0 and b.locked_timeout == 0:
             out.append(f"behaviour '{b.name}' has timeout=0, so it never runs (or is locked-timeout only)")
     return out
+
+
+def parse_fragment(text: str, source: str = "fragment") -> ParsedFragment:
+    """Vet fragment text and normalise it, once. Raises Refused with a fixable message."""
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        raise Refused(f"{source} is not valid TOML: {err}") from err
+
+    stray = [k for k in doc if k != "idle"]
+    if stray:
+        raise Refused(
+            f"{source} defines {', '.join('[' + s + ']' for s in stray)} outside [idle]. "
+            "This block is spliced verbatim into the user's config, so unrelated tables "
+            "would override unrelated keys. Keep the fragment to idle only."
+        )
+    idle = doc.get("idle", {})
+    behs = behaviors_of(idle)
+    if not behs:
+        raise Refused(f"{source} defines no [idle.behavior.*] entries")
+    return ParsedFragment(
+        text=text,
+        doc=doc,
+        behaviors=tuple(behs),
+        warnings=tuple(warnings_of(idle, behs)),
+    )
+
+
+def load_fragment(path: Path) -> ParsedFragment:
+    if not path.is_file():
+        raise Refused(f"fragment not found: {path}")
+    return parse_fragment(path.read_text(encoding="utf-8"), str(path))
+
+
+def read_fragment(path: Path) -> str:
+    """Read and vet the fragment. Raises Refused with a fixable message."""
+    return load_fragment(path).text
+
+
+def behaviors(fragment_text: str) -> list[Behavior]:
+    """Fragment text → Behaviours, for one-shot callers that hold no ParsedFragment."""
+    return list(parse_fragment(fragment_text).behaviors)
+
+
+def warnings(fragment_text: str) -> list[str]:
+    """Things that are legal but almost certainly typos."""
+    return list(parse_fragment(fragment_text).warnings)
+
+
+# ── the managed block: one value type, located once over the document ────────────────────
+#
+# Markers are matched whole-line, by stable prefix: blocks written by older versions carry a
+# repo-layout hint in the BEGIN text, and the prefix is what identifies them — old blocks stay
+# valid, and `install` rewrites them with today's wording. Every damage state is refused with a
+# remedy; the file is never guessed at.
+
+
+BEGIN_PREFIX = "# >>> nri-idle managed block"
+END_PREFIX = "# <<< nri-idle managed block"
+BEGIN = BEGIN_PREFIX + " — edit your idle fragment, not this block ('nri-idle status' shows its path) >>>"
+END = END_PREFIX + " <<<"
+
+BLOCK_ABSENT = "absent"
+BLOCK_INTACT = "intact"
+BLOCK_BEGIN_ONLY = "begin_only"
+BLOCK_END_ONLY = "end_only"
+BLOCK_INTERLEAVED = "interleaved"
+BLOCK_MULTIPLE = "multiple"
+BLOCK_UNPARSEABLE_BODY = "unparseable_body"
+
+
+@dataclass(frozen=True)
+class ManagedBlock:
+    """The marker-delimited region of a target document: its state, its spans, its body."""
+
+    state: str                       # one of the BLOCK_* constants; only absent/intact are usable
+    begin: tuple[int, int] | None    # char span of the BEGIN marker line, newline included
+    end: tuple[int, int] | None      # char span of the END marker line, newline included
+    body: str                        # text between the markers ("" unless both are present)
+    detail: str = ""                 # why the body will not parse, for the remedy
+
+    @classmethod
+    def locate(cls, text: str) -> ManagedBlock:
+        begins: list[tuple[int, int]] = []
+        ends: list[tuple[int, int]] = []
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            content = line.strip()
+            if content.startswith(BEGIN_PREFIX):
+                begins.append((offset, offset + len(line)))
+            elif content.startswith(END_PREFIX):
+                ends.append((offset, offset + len(line)))
+            offset += len(line)
+        if not begins and not ends:
+            return cls(BLOCK_ABSENT, None, None, "")
+        if len(begins) > 1 or len(ends) > 1:
+            return cls(BLOCK_MULTIPLE, begins[0], ends[0] if ends else None, "")
+        if not begins:
+            return cls(BLOCK_END_ONLY, None, ends[0], "")
+        if not ends:
+            return cls(BLOCK_BEGIN_ONLY, begins[0], None, "")
+        if ends[0][0] < begins[0][0]:
+            return cls(BLOCK_INTERLEAVED, begins[0], ends[0], "")
+        body = text[begins[0][1] : ends[0][0]]
+        try:
+            tomllib.loads(body)
+        except tomllib.TOMLDecodeError as err:
+            return cls(BLOCK_UNPARSEABLE_BODY, begins[0], ends[0], body, str(err))
+        return cls(BLOCK_INTACT, begins[0], ends[0], body)
+
+    @property
+    def damaged(self) -> bool:
+        return self.state not in (BLOCK_ABSENT, BLOCK_INTACT)
+
+    def refusal(self, where: str | None = None) -> Refused:
+        """One refusal per damage state, always with a way out of it."""
+        remedy = {
+            BLOCK_BEGIN_ONLY: "delete the orphan BEGIN line, or put the missing END line "
+                              f"('{END}') after the block body",
+            BLOCK_END_ONLY: "delete the orphan END line, or put the missing BEGIN line "
+                            f"('{BEGIN}') before the block body",
+            BLOCK_INTERLEAVED: "the END line sits before the BEGIN line — delete both marker "
+                               "lines, then re-run 'nri-idle install' for one clean block",
+            BLOCK_MULTIPLE: "delete all but one block, marker lines included, then re-run "
+                            "'nri-idle install'",
+            BLOCK_UNPARSEABLE_BODY: "fix the TOML between the marker lines, or delete both marker "
+                                    "lines, then re-run 'nri-idle install'",
+        }[self.state]
+        place = where or "the target file"
+        return Refused(
+            f"{place} is damaged: the managed block is {self.state}"
+            + (f" ({self.detail})" if self.detail else "")
+            + f". {remedy}.\nFind the marker lines with: grep -n 'nri-idle managed block' {place}"
+        )
+
+    def replaced(self, text: str, new_block: str) -> str:
+        """Swap in a fresh block (pure). The user's text around it keeps its exact bytes."""
+        if self.state == BLOCK_ABSENT:
+            return new_block if not text.strip() else text.rstrip("\n") + "\n\n" + new_block
+        self._require_intact()
+        head, tail = text[: self.begin[0]], text[self.end[1] :]
+        tail = tail.lstrip("\n")
+        return head + new_block + ("\n" + tail if tail else "")
+
+    def without(self, text: str) -> str:
+        """Drop the block and the blank line that separated it from the user's own text."""
+        self._require_intact()
+        head, tail = text[: self.begin[0]], text[self.end[1] :]
+        return head.rstrip("\n") + ("\n\n" + tail.lstrip("\n") if tail.strip() else "\n")
+
+    def user_text(self, text: str) -> str:
+        """The target with the managed block removed — i.e. only the user's own text."""
+        if self.state == BLOCK_ABSENT:
+            return text
+        self._require_intact()
+        return text[: self.begin[0]] + text[self.end[1] :]
+
+    def _require_intact(self) -> None:
+        if self.state != BLOCK_INTACT:
+            raise self.refusal() if self.damaged else Refused(f"the managed block is {self.state}")
+
+
+def verify_rewrite(before: str, after: str, where: str, what: str) -> None:
+    """The safety net under every write: `idle` may change, nothing else may.
+
+    The splice is textual, so a marker-lookalike line inside a multi-line string would make
+    it edit a *value*. Only a parse can prove otherwise — both sides must be valid TOML and
+    every key but `idle` must compare equal. Anything else is refused with the file intact.
+    """
+    try:
+        before_rest = {k: v for k, v in tomllib.loads(before).items() if k != "idle"}
+    except tomllib.TOMLDecodeError as err:
+        raise Refused(
+            f"{where} is not valid TOML ({err}); fix it before asking nri-idle to change it"
+        ) from err
+    try:
+        after_rest = {k: v for k, v in tomllib.loads(after).items() if k != "idle"}
+    except tomllib.TOMLDecodeError as err:
+        raise Refused(f"{what} would leave {where} unparseable ({err}). Nothing was written") from err
+    if before_rest != after_rest:
+        raise Refused(
+            f"{what} would change data outside [idle] in {where} — most likely a marker-lookalike "
+            "line inside a multi-line string. Nothing was written; inspect the file with: "
+            f"grep -n 'nri-idle managed block' {where}"
+        )
 
 
 def block(fragment_text: str) -> str:
@@ -225,7 +533,8 @@ def idle_regions(text: str) -> list[tuple[int, int]]:
     """Line spans of the `[idle]` / `[idle.*]` tables *outside* any managed block.
 
     TOML tables are delimited by header lines, so a table runs from its header to the next
-    header of any kind. Adjacent idle headers form one region.
+    header of any kind. Adjacent idle headers form one region. This is a line scan, not a
+    TOML parser — every removal it nominates is verified by `strip_idle` before it counts.
     """
     lines = text.splitlines(keepends=True)
     headers = [(i, is_idle_header(line)) for i, line in enumerate(lines) if HEADER_RE.match(line)]
@@ -245,58 +554,52 @@ def idle_regions(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def strip_idle(text: str) -> str:
-    """Remove every `[idle*]` table region. Only ever called under the explicit flag."""
+def strip_idle(text: str, where: str) -> str:
+    """Remove every `[idle*]` table region. Only ever called under the explicit flag.
+
+    The line scan above only nominates candidate spans — a `[lucky]`-lookalike line inside a
+    multi-line string looks like a table header and can end a region mid-value, so cutting at
+    the nominated span would leave the user's string in pieces. tomllib is the arbiter: every
+    removal must parse and leave every key but `idle` untouched (so the lookalike survives),
+    or the whole operation refuses. The blank-line tidy-up at the end is verified the same way.
+    """
     lines = text.splitlines(keepends=True)
+    out = text
     for start, end in reversed(idle_regions(text)):
         del lines[start:end]
-    out = "".join(lines)
-    while "\n\n\n" in out:
-        out = out.replace("\n\n\n", "\n\n")
-    return out
-
-
-def user_text_of(target_text: str) -> str:
-    """The target with the managed block removed — i.e. only the user's own text."""
-    if BEGIN not in target_text or END not in target_text:
-        return target_text
-    head, _, rest = target_text.partition(BEGIN)
-    _, _, tail = rest.partition(END)
-    return head + tail
-
-
-def splice(target_text: str, fragment_text: str) -> str:
-    """Replace the managed block, or append it. Pure function — the heart of the module."""
-    new_block = block(fragment_text)
-    has_begin = BEGIN in target_text
-    has_end = END in target_text
-    if has_begin != has_end:
-        raise Refused(
-            "the managed block is damaged: exactly one of the two marker lines is present. "
-            f"Find them with: grep -n 'nri-idle managed block' {DEFAULT_TARGET}"
-        )
-    if has_begin:
-        head, _, rest = target_text.partition(BEGIN)
-        _, _, tail = rest.partition(END)
-        tail = tail.lstrip("\n")
-        joined = head + new_block
-        return joined + ("\n" + tail if tail else "")
-    if target_text.strip():
-        return target_text.rstrip("\n") + "\n\n" + new_block
-    return new_block
+        kept = "".join(lines)
+        verify_rewrite(out, kept, where, "removing the [idle] tables")
+        out = kept
+    tidied = out
+    while "\n\n\n" in tidied:
+        tidied = tidied.replace("\n\n\n", "\n\n")
+    verify_rewrite(out, tidied, where, "tidying the blank lines the removal left")
+    return tidied
 
 
 def render(fragment: Path, target: Path, replace_idle: bool = False) -> str:
-    """The merged target file. Reads only; never writes.
+    """The merged target file. Reads only; never writes."""
+    return render_fragment(load_fragment(fragment), target, replace_idle=replace_idle)
+
+
+def render_fragment(frag: ParsedFragment, target: Path, replace_idle: bool = False) -> str:
+    """The merge itself, over a fragment parsed once — install shares this, parse-free.
 
     If the target already defines idle tables of its own (hand-written, or left over from a
     previous hand-edit), splicing would redefine them and Noctalia would refuse the file. That
     is detected here, before anything is written, and refused with the remedy — replacing the
     user's own idle text is destructive, so it only happens under an explicit flag.
+
+    The merged result is verified before it is returned: it must parse, and it must differ
+    from the target only inside `[idle]`.
     """
-    fragment_text = read_fragment(fragment)
+    fragment_text = frag.text
     target_text = target.read_text(encoding="utf-8") if target.is_file() else ""
-    user_text = user_text_of(target_text)
+    where = str(target)
+    blk = ManagedBlock.locate(target_text)
+    if blk.damaged:
+        raise blk.refusal(where)
+    user_text = blk.user_text(target_text)
     if idle_regions(user_text):
         if not replace_idle:
             raise Refused(
@@ -304,8 +607,22 @@ def render(fragment: Path, target: Path, replace_idle: bool = False) -> str:
                 "would define them twice. Either delete them yourself, or re-run with "
                 "--replace-idle to have this tool remove them (a backup is taken first)."
             )
-        target_text = splice(strip_idle(user_text), fragment_text)
-    return splice(target_text, fragment_text)
+        stripped = strip_idle(user_text, where)
+        candidate = ManagedBlock.locate(stripped).replaced(stripped, block(fragment_text))
+    else:
+        candidate = blk.replaced(target_text, block(fragment_text))
+    verify_rewrite(target_text, candidate, where, "splicing in the managed block")
+    return candidate
+
+
+class Steps(list):
+    """The steps a command took, plus the exit code the command earned.
+
+    The lines are the user-facing account; the code travels with them so `main` never has to
+    re-derive policy from prose — a FAILED reload must cost an exit 1 because of what it *is*,
+    not because a caller grepped for a substring."""
+
+    exit_code: int = 0
 
 
 def install(
@@ -315,20 +632,23 @@ def install(
     dry_run: bool = False,
     reload: bool = True,
     replace_idle: bool = False,
-) -> list[str]:
-    """Splice, validate the candidate, then write. Returns human-readable steps."""
-    steps: list[str] = []
-    candidate_text = render(fragment, target, replace_idle=replace_idle)
-    for w in warnings(read_fragment(fragment)):
+) -> Steps:
+    """Splice, validate the candidate, then write. Returns the steps and the exit code.
+
+    The dry run is a rehearsal, not an early return: it renders and validates exactly what a
+    real run would, and refuses exactly the same way — the only thing it skips is writing
+    user state (the target, its backups). The exit code is 0 only when everything including
+    the reload succeeded; a FAILED reload leaves the file written but is still a failure.
+    """
+    steps = Steps()
+    frag = load_fragment(fragment)  # read and parse once; render and warnings share it
+    candidate_text = render_fragment(frag, target, replace_idle=replace_idle)
+    for w in frag.warnings:
         steps.append(f"warning: {w}")
 
-    if dry_run:
-        steps.append(f"dry-run: {target} would be written ({len(candidate_text)} bytes)")
-        return steps
-
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # The probe lives in the system temp dir so even a rehearsal touches no user state.
     with tempfile.NamedTemporaryFile(
-        "w", suffix=".toml", delete=False, dir=target.parent, encoding="utf-8"
+        "w", suffix=".toml", delete=False, encoding="utf-8"
     ) as tmp:
         tmp.write(candidate_text)
         probe = Path(tmp.name)
@@ -342,6 +662,18 @@ def install(
     finally:
         probe.unlink(missing_ok=True)
 
+    if dry_run:
+        steps.append(f"dry-run: {target} would be written ({len(candidate_text)} bytes)")
+        if target.is_file():
+            steps.append(f"dry-run: a backup of {target} would be taken")
+        steps.append(
+            "dry-run: the running shell would be reloaded"
+            if reload
+            else "dry-run: the running shell would not be reloaded (--no-reload)"
+        )
+        return steps
+
+    target.parent.mkdir(parents=True, exist_ok=True)
     if target.is_file():
         backup = target.with_suffix(target.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
         shutil.copy2(target, backup)
@@ -352,60 +684,51 @@ def install(
     if reload:
         ok, message = noctalia.reload()
         steps.append(f"reloaded the running shell: {'ok' if ok else 'FAILED — ' + message}")
+        if not ok:
+            steps.exit_code = 1
+            steps.append(
+                "the reload failed: the file is written, but the running shell has not picked "
+                "it up — re-run 'noctalia msg config-reload' or 'nri-idle install'"
+            )
     steps.append("check what is actually running with: nri-idle status")
     return steps
 
 
-def parsed_idle_behaviors(export_text: str) -> list[Behavior]:
-    """Behaviours as Noctalia resolved them — proof about the *running* config, not the file."""
-    if not export_text.strip():
-        return []
-    try:
-        doc = tomllib.loads(export_text)
-    except tomllib.TOMLDecodeError:
-        return []
-    idle = doc.get("idle", {})
-    out = []
-    for name, spec in (idle.get("behavior") or {}).items():
-        out.append(
-            Behavior(
-                name=name,
-                action=str(spec.get("action", "command")),
-                timeout=float(spec.get("timeout", 0) or 0),
-                locked_timeout=float(spec.get("locked_timeout", 0) or 0),
-                enabled=bool(spec.get("enabled", True)),
-            )
-        )
-    return out
-
-
-def effective(behaviors_: list[Behavior]) -> list[Behavior]:
-    """The behaviours Noctalia actually registers: enabled, with a timeout that can fire.
-
-    Disabled blocks, and blocks whose only timeout is 0, are deliberately absent from
-    `noctalia config export full` — treating that as drift would cry wolf on every
-    example you keep switched off.
-    """
-    return [b for b in behaviors_ if b.enabled and (b.timeout > 0 or b.locked_timeout > 0)]
-
-
 def status(fragment: Path, target: Path, noctalia) -> int:
-    fragment_text = read_fragment(fragment)
-    want = behaviors(fragment_text)
+    frag = load_fragment(fragment)
+    want = list(frag.behaviors)
     target_text = target.read_text(encoding="utf-8") if target.is_file() else ""
-    managed = BEGIN in target_text and END in target_text
-    hand_written = idle_regions(user_text_of(target_text))
-    up_to_date = managed and splice(target_text, fragment_text) == target_text
+    blk = ManagedBlock.locate(target_text)
+    if blk.damaged:
+        raise blk.refusal(str(target))
+    managed = blk.state == BLOCK_INTACT
+    hand_written = idle_regions(blk.user_text(target_text))
 
     print(f"fragment : {fragment}")
     print(f"target   : {target}")
-    print(f"managed  : {'yes' if managed else 'no'}"
-          + ("  (out of date — re-run 'nri-idle install')" if managed and not up_to_date else ""))
+    out_of_date = False
+    if not managed:
+        print("managed  : no")
+    else:
+        # Three states, decided on parsed content first: parsed-equal is never drift.
+        # Bytes equal → up to date. Bytes differ but parsed equal → formatting only, which
+        # 'nri-idle install' will normalise (the written bytes stay verbatim until it does).
+        # Parsed differs → out of date, and status exits 1.
+        expected_body = frag.text.strip("\n") + "\n"  # the bytes install writes between markers
+        if tomllib.loads(blk.body) != frag.doc:
+            out_of_date = True
+            print("managed  : yes  (out of date — re-run 'nri-idle install')")
+        elif blk.body != expected_body:
+            print("managed  : yes")
+            print("           formatting only: the block parses identical to the fragment;")
+            print("           'nri-idle install' will normalise it (this is not drift)")
+        else:
+            print("managed  : yes")
     if hand_written:
         print(f"           {len(hand_written)} idle table region(s) in the target are NOT managed:")
         print("           install refuses while they exist — migrate with 'nri-idle install --replace-idle'")
     print(f"rules    : {DEFAULT_RULES} {'(present)' if DEFAULT_RULES.is_file() else '(absent)'}")
-    for w in warnings(fragment_text):
+    for w in frag.warnings:
         print(f"warning  : {w}")
 
     print("\nrequested by the fragment:")
@@ -413,10 +736,27 @@ def status(fragment: Path, target: Path, noctalia) -> int:
         print(f"  {b.summary()}")
 
     print("\nresolved by the running Noctalia (noctalia config export full):")
-    live = parsed_idle_behaviors(noctalia.exported_idle())
+    res = noctalia.exported_idle()
+    if res.kind == EXPORT_NOT_FOUND:
+        print(f"  (could not read the shell: {res.detail or 'noctalia: not found'})")
+        print("  install Noctalia or pass --noctalia")
+        return 3
+    if res.kind == EXPORT_TIMEOUT:
+        print(f"  (could not read the shell: {res.detail or 'the export timed out'})")
+        print("  is the shell wedged?")
+        return 3
+    if res.kind == EXPORT_FAILED:
+        print(f"  (could not read the shell: the export failed — {res.detail})")
+        return 3
+    if res.kind != EXPORT_OK:
+        # empty or unparseable: the shell answered, but with nothing to compare against.
+        note = f" — {res.detail}" if res.kind == EXPORT_UNPARSEABLE and res.detail else ""
+        print(f"  the running shell exports no idle behaviours{note}")
+        return 4
+    live = normalise_export(res.text)
     if not live:
-        print("  (nothing — is Noctalia running?)")
-        return 1
+        print("  the running shell exports no idle behaviours")
+        return 4
     for b in live:
         print(f"  {b.summary()}")
 
@@ -425,37 +765,101 @@ def status(fragment: Path, target: Path, noctalia) -> int:
         print(f"\ndrift    : {', '.join(drift)} — the file says one thing, the shell another.")
         print("           Run 'noctalia msg config-reload' (or 'nri-idle install').")
         return 1
+    if out_of_date:
+        print("\nthe running shell matches the fragment; only the managed block is out of date.")
+        return 1
     print(f"\nevery requested behaviour that should be running is live ({len(effective(want))}).")
     return 0
 
 
-def uninstall(fragment: Path, target: Path, noctalia, dry_run: bool = False) -> list[str]:
-    steps: list[str] = []
+def uninstall(
+    fragment: Path, target: Path, noctalia, dry_run: bool = False, reload: bool = True
+) -> Steps:
+    """Remove the managed block and nothing else. Returns the steps and the exit code."""
+    steps = Steps()
     if not target.is_file():
         raise Refused(f"{target} does not exist")
     target_text = target.read_text(encoding="utf-8")
-    if BEGIN not in target_text:
+    blk = ManagedBlock.locate(target_text)
+    if blk.damaged:
+        raise blk.refusal(str(target))
+    if blk.state == BLOCK_ABSENT:
         steps.append(f"nothing to do: no managed block in {target}")
         return steps
-    # Drop the block and the blank line that separated it from the user's own text.
-    head, _, rest = target_text.partition(BEGIN)
-    _, _, tail = rest.partition(END)
-    stripped = head.rstrip("\n") + ("\n\n" + tail.lstrip("\n") if tail.strip() else "\n")
+    stripped = blk.without(target_text)
+    verify_rewrite(target_text, stripped, str(target), "removing the managed block")
     if dry_run:
         steps.append(f"dry-run: the managed block would be removed from {target}")
+        steps.append(f"dry-run: a backup of {target} would be taken")
+        steps.append(
+            "dry-run: the running shell would be reloaded"
+            if reload
+            else "dry-run: the running shell would not be reloaded (--no-reload)"
+        )
         return steps
     backup = target.with_suffix(target.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
     shutil.copy2(target, backup)
     target.write_text(stripped, encoding="utf-8")
     steps.append(f"backed up: {backup}")
     steps.append(f"removed the managed block from {target}")
-    ok, message = noctalia.reload()
-    steps.append(f"reloaded the running shell: {'ok' if ok else 'FAILED — ' + message}")
+    if reload:
+        ok, message = noctalia.reload()
+        steps.append(f"reloaded the running shell: {'ok' if ok else 'FAILED — ' + message}")
+        if not ok:
+            steps.exit_code = 1
+            steps.append(
+                "the reload failed: the block is removed from the file, but the running shell "
+                "is still live with it — re-run 'noctalia msg config-reload'"
+            )
     steps.append("note: the media bridge is separate; stop it with: systemctl --user disable --now media-idle-bridge")
     return steps
 
 
+# ── the installed layout: owned here, printed by `paths` ─────────────────────────────────
+
+
+def layout(fragment: Path, target: Path, noctalia: str = "noctalia") -> dict[str, str]:
+    """Every location this toolset installs into, resolved. One module owns the layout."""
+    return {
+        "fragment": str(fragment),
+        "target": str(target),
+        "rules": str(DEFAULT_RULES),
+        "bin_dir": str(DEFAULT_BIN_DIR),
+        "unit": str(DEFAULT_UNIT),
+        "noctalia": str(noctalia),
+    }
+
+
+def paths(fragment: Path, target: Path, noctalia: str = "noctalia") -> list[str]:
+    """Resolved locations as `key=value` lines — shell-greppable, and nothing else."""
+    return [f"{key}={value}" for key, value in layout(fragment, target, noctalia).items()]
+
+
 # ── entry point ──────────────────────────────────────────────────────────────────────────
+
+
+COMMANDS = ("render", "install", "status", "uninstall", "paths")
+
+# The applicability contract: which flags each command accepts. One table — `build_parser`
+# turns it into help text, `main` enforces it before dispatch, and the tests iterate it as
+# the matrix. A flag outside its commands is a hard error: a silently ignored flag is a lie
+# about what the run did.
+ALL_COMMANDS = frozenset(COMMANDS)
+FLAG_APPLICABILITY: dict[str, frozenset[str]] = {
+    "--fragment": ALL_COMMANDS,
+    "--target": ALL_COMMANDS,
+    "--noctalia": ALL_COMMANDS,
+    "--dry-run": frozenset({"install", "uninstall"}),
+    "--no-reload": frozenset({"install", "uninstall"}),
+    "--replace-idle": frozenset({"render", "install"}),
+}
+
+
+def _applies(flag: str) -> str:
+    allowed = FLAG_APPLICABILITY[flag]
+    if allowed == ALL_COMMANDS:
+        return " (all commands)"
+    return " (commands: " + ", ".join(c for c in COMMANDS if c in allowed) + ")"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -464,41 +868,76 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("command", choices=["render", "install", "status", "uninstall"])
-    ap.add_argument("--fragment", type=Path, default=DEFAULT_FRAGMENT,
-                    help=f"the idle fragment to inject (default: {DEFAULT_FRAGMENT})")
+    ap.add_argument("command", choices=COMMANDS)
+    ap.add_argument("--fragment", type=Path, default=None,
+                    help=f"the idle fragment to inject (default: {OWNED_FRAGMENT})" + _applies("--fragment"))
     ap.add_argument("--target", type=Path, default=DEFAULT_TARGET,
-                    help=f"the Noctalia config to inject into (default: {DEFAULT_TARGET})")
-    ap.add_argument("--noctalia", default="noctalia", help="the noctalia binary to drive")
-    ap.add_argument("--dry-run", action="store_true", help="say what would happen; write nothing")
-    ap.add_argument("--no-reload", action="store_true", help="do not reload the running shell")
+                    help=f"the Noctalia config to inject into (default: {DEFAULT_TARGET})" + _applies("--target"))
+    ap.add_argument("--noctalia", default="noctalia",
+                    help="the noctalia binary to drive" + _applies("--noctalia"))
+    ap.add_argument("--dry-run", action="store_true",
+                    help="say what would happen; write nothing" + _applies("--dry-run"))
+    ap.add_argument("--no-reload", action="store_true",
+                    help="do not reload the running shell" + _applies("--no-reload"))
     ap.add_argument(
         "--replace-idle",
         action="store_true",
         help="remove idle tables the target already defines outside the managed block "
-             "(how you migrate a hand-written idle config under management)",
+             "(how you migrate a hand-written idle config under management)" + _applies("--replace-idle"),
     )
     return ap
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    noctalia = RealNoctalia(args.noctalia)
+def applicability_violations(args: argparse.Namespace) -> list[str]:
+    """The flag × command cells the contract forbids. Empty means the run may proceed."""
+    problems = []
+    for flag, commands in FLAG_APPLICABILITY.items():
+        if args.command in commands:
+            continue
+        if getattr(args, flag.lstrip("-").replace("-", "_"), False):
+            problems.append(
+                f"{flag} does not apply to '{args.command}' "
+                f"(it applies to: {', '.join(c for c in COMMANDS if c in commands)})"
+            )
+    return problems
+
+
+def main(argv: list[str] | None = None, noctalia=None) -> int:
+    """The command line. `noctalia` is injected so the whole interface is testable."""
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    problems = applicability_violations(args)
+    if problems:
+        ap.print_usage(sys.stderr)
+        for problem in problems:
+            print(f"nri-idle: error: {problem}", file=sys.stderr)
+        return 2
+    noctalia = noctalia if noctalia is not None else RealNoctalia(args.noctalia)
+    # Every command but `paths` acts on whichever fragment is in place (first existing
+    # candidate); `paths` reports the location the user owns — the place install.sh seeds.
+    fragment = args.fragment if args.fragment is not None else DEFAULT_FRAGMENT
     try:
         if args.command == "render":
-            sys.stdout.write(render(args.fragment, args.target, replace_idle=args.replace_idle))
-            return 0
-        if args.command == "install":
-            for step in install(args.fragment, args.target, noctalia,
-                                dry_run=args.dry_run, reload=not args.no_reload,
-                                replace_idle=args.replace_idle):
-                print(step)
+            sys.stdout.write(render(fragment, args.target, replace_idle=args.replace_idle))
             return 0
         if args.command == "status":
-            return status(args.fragment, args.target, noctalia)
-        for step in uninstall(args.fragment, args.target, noctalia, dry_run=args.dry_run):
+            return status(fragment, args.target, noctalia)
+        if args.command == "paths":
+            owned = owned_fragment(HERE, Path.home(), os.environ.get("NRI_IDLE_FRAGMENT"),
+                                   args.fragment)
+            for line in paths(owned, args.target, args.noctalia):
+                print(line)
+            return 0
+        if args.command == "install":
+            steps = install(fragment, args.target, noctalia,
+                            dry_run=args.dry_run, reload=not args.no_reload,
+                            replace_idle=args.replace_idle)
+        else:
+            steps = uninstall(fragment, args.target, noctalia,
+                              dry_run=args.dry_run, reload=not args.no_reload)
+        for step in steps:
             print(step)
-        return 0
+        return steps.exit_code
     except Refused as err:
         print(f"refused: {err}", file=sys.stderr)
         return 2

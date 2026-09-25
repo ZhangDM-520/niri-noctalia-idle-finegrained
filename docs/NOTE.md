@@ -99,3 +99,77 @@ decisions not to re-litigate) and this journal, plus a "For maintainers" section
 * The "a video is playing but every window reports Paused" case was set aside during verification.
 * `HEADLESS-1` output DPMS behaviour is unverified.
 * Upstream: when PR #4002 merges, MANUAL §9.1's stopgap can shrink to a historical note.
+
+---
+
+## 2026-09-26 — Fleet implementation: all six architecture candidates, three waves + integration
+
+The owner went offline with one instruction: implement **all six** candidates from the architecture
+review, in waves, judging the shape myself. Three implementation waves ran in parallel (two in wave
+1), then an integration pass. What each wave chose, and what it found:
+
+**Wave 1 — the two cores.** *(candidate 1+2, the media bridge)*: a `MediaSource` seam
+(`snapshot`/`start`/`stop`, MPRIS + PipeWire adapters) so `--once` and the daemon share one decision
+path; one pw-dump model (`ingest`) replacing two disagreeing ones; `Rules` validation with
+warn-and-fallback (never crash-loop); verdicts now name the matched rule. *(candidate 3+4, nri-idle)*:
+`ManagedBlock` as a value type with explicit damage states (absent · intact · begin-only · end-only ·
+interleaved · multiple · unparseable-body), whole-line prefix markers so legacy blocks still match,
+and every mutation parse-verified on both sides; `ParsedFragment` parsed once per command;
+`normalise_export` pure beside the Noctalia port; six authored synthetic export fixtures (recorded
+user exports were rejected for privacy).
+
+**Wave 2 — the CLI surface** *(candidate 6)*: declarative `FLAG_APPLICABILITY` (an inapplicable flag
+is now a usage error, exit 2, not silence), typed `ExportResult` at the port edge, `status` exit
+fan-out 0/1/2/3/4 with 3 and 4 (shell unreadable / export empty) outranking drift, `install --dry-run`
+validating for real, `install`/`uninstall` exiting 1 on a failed reload, `uninstall --no-reload`
+honoured, and a fifth command `paths` printing the installed layout as `key=value` lines.
+
+**Wave 3 — install.sh** *(candidate 5)*: the script now consumes `nri-idle paths` for every location
+(zero `.config/` literals), one argument list and one refusal handler for both the real and the
+dry-run branch, and a dry run that is a line-for-line rehearsal (same checks, same refusals, zero
+writes, `dry-run: would …`).
+
+**Bugs this found and fixed** (each was real, none theoretical):
+
+1. **Music masked the PipeWire backstop** — `decide()` returned "no inhibit" the moment any MPRIS
+   player was music, so an `ffplay` video dimmed the screen over the film. Now: any video inhibits,
+   video beats music, music never masks the backstop.
+2. **Two pw-dump models disagreed** about a node event missing `info` (removed vs. skipped).
+3. **A wrong-typed rule value crash-looped the daemon** (a scalar iterated as characters mid-evaluation,
+   under `Restart=on-failure`); `browser_default` typos silently inverted the fail-safe.
+4. **`install.sh --dry-run` dropped `--replace-idle`** — the rehearsal could bless what the real run
+   would refuse. Found by the wave-3 dry-run/real-run equality test.
+5. **`--replace-idle` could delete END-only or interleaved idle tables** the line-regex parser could
+   not see — silent data loss, now parse-verified and refused on damage.
+6. **`status` leaned on an `export_for()` fiction** (a function that never existed) to distinguish
+   "shell unreadable" from "no export"; the typed `ExportResult` replaced the guessing.
+7. **`nri-idle paths` reported the resolved *source* fragment** instead of the user-owned location,
+   so `install.sh` could not seed a fresh machine — reported by wave 3 against wave 2's output and
+   fixed in the integration pass (`owned_fragment()`: explicit → `NRI_IDLE_FRAGMENT` →
+   `~/.config/nri-idle/idle.toml`; a checkout copy is a source, never the answer).
+
+**Shape calls recorded so they are not re-litigated:** inhibitor seam in the bridge deferred (the
+`MediaSource` seam already makes the decision path testable); port-parsing `ParsedFragment` rejected
+in favour of parsing once per command; the classification substring match stays case-insensitive
+(including `video_roles`); MANUAL §10's rule 3 was corrected — the code treats a URL-bearing non-music
+host as video, and `browser_default` applies only to URL-less players.
+
+**Behaviour changes accepted:** `status` exits 1 on real drift only (formatting is info), exits 3/4
+for unreadable/empty shells; a damaged target is refused by `uninstall` and dry runs too; failed
+reloads exit 1; `--no-bridge` exits 0 (it used to exit 1 as a leftover status); `paths` gains a
+`noctalia=` key.
+
+**Closed from the previous entry's deferred list:** the classification core now has a pure test
+surface (`tests/test_media_rules.py`, 56 tests); the whole suite is 169 tests and drives `install.sh`
+itself. Still deferred: the "video playing but every window reports Paused" case; `HEADLESS-1` DPMS
+verification; shrinking MANUAL §9.1's stopgap once PR #4002 is in a release.
+
+**Integration-pass addendum.** The live suite initially failed 10/15 with `block=idle:handle-power-key`
+— not the bridge: Noctalia **Caffeine** was on (it holds a logind `idle` inhibitor *and* a Wayland one
+swayidle sees), and `niri` holds `handle-power-key` (harmless). The suite's two signals are global, so
+it now *refuses to run* when a foreign idle inhibitor is held (exit 2, naming
+`noctalia msg caffeine-disable`) instead of blaming the bridge. With Caffeine off: **15/15, 0
+indeterminate** — the rewritten bridge inhibits for MPRIS video, VLC, and URL-bearing/no-URL browsers,
+stays out of the way for music and paused players, and releases on SIGTERM. Caffeine was re-enabled
+after the run. `./install.sh` on the host, `nri-idle status` (exit 0, three behaviours live), and the
+169-test unit suite all green; suite and docs updated with the trap.
