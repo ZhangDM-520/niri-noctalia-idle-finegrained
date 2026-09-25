@@ -1,0 +1,101 @@
+# Working journal
+
+Chronological record of how this toolset got here, for the next maintainer: what was built, what was
+decided and why, and what each round of verification actually proved. Durable facts and traps live in
+[MEMORY.md](MEMORY.md); design rationale lives in [DESIGN.md](DESIGN.md). Keep entries dated and short.
+
+## 2026-09-21 — from a swayidle config to a published toolset
+
+Origin: the owner wanted *dim 50 s → screen off 70 s → lock 120 s* that respects media — **music must
+not keep the screen awake, video must**. Three things were established before any code was written:
+
+1. **No idle engine on Wayland can tell music from video.** niri owns `org.freedesktop.ScreenSaver`
+   and ORs D-Bus `Inhibit` into the idle-notify state, so what reaches any idle engine is one bit:
+   *"an inhibitor exists"*. Every "media-aware" setup is something translating *is this video?* into
+   that bit. Hence a daemon, not a clever timeout command.
+2. **Idle ownership moved from swayidle to Noctalia** (it has native `dim`/`screen_off`/`lock`
+   behaviours), keeping swayidle for `before-sleep` only, because logind's `PrepareForSleep` is the
+   one signal Noctalia does not own.
+3. **The policy is a native fragment, not flags.** The deletion test decided it: without the CLI the
+   fragment is still a valid Noctalia config.
+
+Then the work split in two: `bin/media-idle-bridge` (the *is this video?* translator) and `bin/nri-idle`
+(inject/verify the policy). Live verification on niri 26.04 covered NetEase (music), Zen (music URL vs
+video URL), mpv and VLC — that table is in the MANUAL, because those identities are load-bearing and
+each one cost a debugging round.
+
+## 2026-09-21/22 — the toolset becomes a repo others can use
+
+`/codebase-design` pass: the one-off scripts became two modules behind small interfaces, with the
+`noctalia` binary behind a port so the suite runs without a compositor. **Three real bugs surfaced from
+the interface tests** (duplicate `[idle]` tables, false drift on disabled behaviours, installed-copy
+fragment resolution) — all invisible while the code was a one-off that ran only on the author's machine.
+That is the argument for testing *at the interface*: the bugs were in how the pieces were called, not in
+the pieces.
+
+Published at <https://github.com/ZhangDM-520/niri-noctalia-idle-finegrained>.
+
+## 2026-09-22 — the lock woke the screen, and the fix belonged upstream
+
+Report: *"when lock is triggered, the screen will be wakeup and again wait for idle timeout to shutoff."*
+
+* Root cause was **not** in this repo: Noctalia's `setSessionLocked()` ran the *resume* action of every
+  already-idled behaviour when re-arming, and `screen_off` hard-wires a `ScreenOn` resume — so the lock
+  lit the panel and restarted every countdown. Measured: `dpms=On` **36 ms after** the lock.
+* A duplicate check first (per the owner's instruction) found the bug already reported as
+  [noctalia-dev/noctalia#4190](https://github.com/noctalia-dev/noctalia/issues/4190) with a mergeable
+  fix in [#4002](https://github.com/noctalia-dev/noctalia/pull/4002) whose Niri box was unticked. So:
+  no second issue, no competing patch — contribute the missing coverage. The fix was built, verified on
+  niri (panel stays `Off` across the lock; brightness still restored on return) and approved upstream.
+* This repo documents the bug and the stopgap instead of vendoring a patch: **README section, MANUAL
+  §9.1, a pointer in `config/idle.toml`**. Stable-Noctalia users can simply wait for the upstream fix.
+
+## 2026-09-22 — a test suite that disabled the desktop
+
+Running the regression suite stopped the production `media-idle-bridge` service and never restarted it;
+the desktop went 4 minutes without media awareness before a final state check caught `inactive`. Fixed
+in `c8ea264`: `cleanup()` on `EXIT` restores the service **only if it was active before the run**.
+General lesson now in MEMORY.md §4: any test that stops a service or takes an exclusive resource must
+put it back on every exit path.
+
+## 2026-09-25 — architecture review for maintainers
+
+Ran `/improve-codebase-architecture` over the whole repo with fresh eyes: where is the depth, where is
+the friction, what would make this easier to maintain. Report: `/tmp/architecture-review-20260925-222920.html`
+(temp dir per that workflow — regenerating is cheap, the findings are what persist). Six deepening
+opportunities, most painful first:
+
+1. **Media-source seam under the classification core** *(Strong)* — `media-idle-bridge` cannot even be
+   imported without python-dbus/PyGObject, so its pure decision core is unreachable from the 32-test
+   suite, and the PipeWire path has zero coverage even live. Found a latent bug along the way:
+   `decide()` returns early when any MPRIS player is music, suppressing the PipeWire backstop — music +
+   an MPRIS-less `ffplay` video dims the screen over playing video.
+2. **The rules file is an interface without a contract** *(Strong)* — precedence, substring matching and
+   value domains live in comments; a `browser_default` typo silently inverts the fail-safe.
+3. **The managed block is one concept implemented three times** *(Strong)* — inconsistent damage rules
+   (`uninstall` checks only the BEGIN marker), byte-equality drift false positives, and a line-regex
+   stand-in for TOML structure that can delete user text under `--replace-idle`.
+4. **One parsed-fragment type** *(Worth exploring)* — two near-duplicate TOML→Behaviour mappings, and
+   the drift invariant is upheld in tests only because `export_for()` is a no-op.
+5. **`install.sh` and `nri-idle` each own the installed layout** *(Worth exploring)* — rules path in
+   three files; `install.sh --dry-run --replace-idle` drops the flag and rehearses a refusal the real
+   run never hits.
+6. **No applicability contract on the CLI's flags** *(Worth exploring)* — inert flag combinations are
+   silently ignored, `install --dry-run` skips the validate invariant, and
+   `Noctalia.exported_idle` collapses three error modes into `""`.
+
+**Top recommendation: #1** — it is the product's reason to exist, it hides a real bug, and its seam
+pays leverage twice (deterministic unit tests + a live suite shrunk to inhibitor lifecycle). Candidate
+#2 is its natural companion: the contract sitting behind it. None of the six contradict DESIGN.md —
+they deepen the same shape (the fragment stays the interface).
+
+This round also added the maintainer docs this repo lacked: `docs/MEMORY.md` (measured facts, traps,
+decisions not to re-litigate) and this journal, plus a "For maintainers" section in the README.
+
+**Not yet done / deliberately deferred:**
+
+* The *is this video?* classification core is only reachable through a live session (the bash suite);
+  there is no pure-logic test surface for the rule table itself.
+* The "a video is playing but every window reports Paused" case was set aside during verification.
+* `HEADLESS-1` output DPMS behaviour is unverified.
+* Upstream: when PR #4002 merges, MANUAL §9.1's stopgap can shrink to a historical note.

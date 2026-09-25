@@ -169,9 +169,21 @@ systemd/media-idle-bridge.service
 tests/test_nri_idle.py     interface tests, Noctalia injected
 tests/bridge-tests.sh      live media classification suite
 docs/DESIGN.md             why the seams are where they are
+docs/MEMORY.md             measured facts, traps, and decisions not to re-litigate
+docs/NOTE.md               working journal: how this got here
 MANUAL.md                  Noctalia idle syntax + media rules reference
 CHANGELOG.md               what changed, and which upstream issues are in play
 ```
+
+## For maintainers
+
+If you are picking this up cold: **[docs/DESIGN.md](docs/DESIGN.md)** explains where the seams are and
+why the interface looks the way it does; **[docs/MEMORY.md](docs/MEMORY.md)** holds the measured facts,
+the traps that cost time, and the decisions that should not be re-litigated without new evidence;
+**[docs/NOTE.md](docs/NOTE.md)** is the dated work journal. The user-facing syntax reference is
+[MANUAL.md](MANUAL.md). Two suites guard changes — `python3 -m unittest discover -s tests` (runs
+anywhere, no display or Noctalia needed) and `./tests/bridge-tests.sh` (needs a live session; it stops
+`media-idle-bridge` while it runs and restores it afterwards).
 
 ## Licence
 
